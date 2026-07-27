@@ -20,11 +20,14 @@ def _make_windows_import_lib(dll: Path, sources: list[str], out_dir: Path) -> Pa
     out_dir.mkdir(parents=True, exist_ok=True)
     symbols: set[str] = set()
     for src in sources:
-        text = Path(src).read_text()
+        # utf-8 explicitly: sources contain non-ASCII comments, and Windows
+        # would otherwise decode with the locale codepage (cp1252).
+        text = Path(src).read_text(encoding="utf-8")
         symbols.update(re.findall(r"\b(mju?_[A-Za-z0-9_]+)\s*\(", text))
     def_path = out_dir / "mujoco.def"
     def_path.write_text(
-        "LIBRARY mujoco.dll\nEXPORTS\n" + "".join(f"  {s}\n" for s in sorted(symbols))
+        "LIBRARY mujoco.dll\nEXPORTS\n" + "".join(f"  {s}\n" for s in sorted(symbols)),
+        encoding="utf-8",
     )
     implib = out_dir / "mujoco.lib"
     machine = {"AMD64": "x64", "ARM64": "ARM64"}[platform.machine()]
