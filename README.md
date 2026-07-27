@@ -2,6 +2,11 @@
 
 English | [简体中文](README_zh.md)
 
+<p align="center">
+  <a href="https://arxiv.org/abs/2605.24922"><img src="https://img.shields.io/badge/arxiv-2605.24922-red" alt="arXiv"></a>
+  <a href="https://unilabsim.github.io/paper/mujocouni.html"><img src="https://img.shields.io/badge/paper-MuJoCoUni-orange" alt="Paper"></a>
+</p>
+
 MuJoCoUni is the standalone UniLab batch-executor layer for official MuJoCo.
 It provides the `BatchEnvPool` API used by UniLab without modifying MuJoCo
 solver, contact, integrator, or source-tree internals.
@@ -388,6 +393,20 @@ MuJoCoUni stays outside these responsibilities:
 - distributed factorization of one MuJoCo solve across MPI ranks,
 - OpenMP inside the MuJoCoUni executor,
 - UniLab task YAMLs, rollout code, reward functions, and DrakeUni behavior.
+
+## Citation
+
+Paper page: [MuJoCoUni](https://unilabsim.github.io/paper/mujocouni.html)
+
+```bibtex
+@article{jia2026mujocouni,
+  title   = {MuJoCoUni: Persistent Batched Runtime Primitives for MuJoCo},
+  author  = {Jia, Yufei and Wu, Junzhe},
+  journal = {arXiv preprint arXiv:2605.24922},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2605.24922}
+}
+```
 
 ## License
 

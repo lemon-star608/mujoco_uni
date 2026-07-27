@@ -2,6 +2,11 @@
 
 简体中文 | [English](README.md)
 
+<p align="center">
+  <a href="https://arxiv.org/abs/2605.24922"><img src="https://img.shields.io/badge/arxiv-2605.24922-red" alt="arXiv"></a>
+  <a href="https://unilabsim.github.io/paper/mujocouni.html"><img src="https://img.shields.io/badge/paper-MuJoCoUni-orange" alt="Paper"></a>
+</p>
+
 MuJoCoUni 是 UniLab 面向官方 MuJoCo 的独立批量执行器（batch-executor）层。它提供 UniLab 使用的 `BatchEnvPool` API，且不修改 MuJoCo 求解器、接触（contact）、积分器或源码树内部。
 
 ## 系统边界
@@ -347,6 +352,20 @@ MuJoCoUni 不承担以下职责：
 - 将单个 MuJoCo 求解跨 MPI rank 分布式分解，
 - 在 MuJoCoUni 执行器内部使用 OpenMP，
 - UniLab 任务 YAML、rollout 代码、奖励函数以及 DrakeUni 行为。
+
+## 引用
+
+论文页面：[MuJoCoUni](https://unilabsim.github.io/paper/mujocouni.html)
+
+```bibtex
+@article{jia2026mujocouni,
+  title   = {MuJoCoUni: Persistent Batched Runtime Primitives for MuJoCo},
+  author  = {Jia, Yufei and Wu, Junzhe},
+  journal = {arXiv preprint arXiv:2605.24922},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2605.24922}
+}
+```
 
 ## 许可证
 
