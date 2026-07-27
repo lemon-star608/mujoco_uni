@@ -7,6 +7,7 @@ entry point is ``mujoco_uni.batch_env``.
 from __future__ import annotations
 
 import ctypes
+import os
 from pathlib import Path
 
 
@@ -14,9 +15,13 @@ def _preload_mujoco_library() -> object | None:
     from mujoco_uni.mujoco_runtime import api as mujoco
 
     mujoco_dir = Path(mujoco.__file__).resolve().parent
-    candidates = sorted(mujoco_dir.glob("libmujoco*"))
+    candidates = sorted(mujoco_dir.glob("libmujoco*")) + sorted(mujoco_dir.glob("mujoco.dll"))
     if not candidates:
         return None
+    if os.name == "nt":
+        # Let the extension's static dependency on mujoco.dll resolve from the
+        # official mujoco package directory.
+        os.add_dll_directory(str(mujoco_dir))
     mode = getattr(ctypes, "RTLD_GLOBAL", 0)
     return ctypes.CDLL(str(candidates[0]), mode=mode)
 

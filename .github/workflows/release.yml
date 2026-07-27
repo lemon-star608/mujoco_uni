@@ -4,6 +4,14 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      mujoco_version:
+        description: MuJoCo version to build the wheels against
+        required: true
+        default: "3.10.0"
+
+env:
+  MUJOCO_VERSION: ${{ inputs.mujoco_version || '3.10.0' }}
 
 jobs:
   test:
@@ -12,23 +20,50 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv venv
-      - run: uv pip install "mujoco==3.10.0" pybind11 numpy pytest setuptools wheel
+      - run: uv pip install "mujoco==${{ env.MUJOCO_VERSION }}" pybind11 numpy pytest setuptools wheel
       - run: uv pip install --no-build-isolation -e .
       - run: .venv/bin/python -m pytest tests/ -q
 
-  publish:
-    needs: test
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write # trusted publishing (no API token stored in GitHub)
-    environment: pypi
+  build:
+    # The native extension links against the mujoco wheel of MUJOCO_VERSION and
+    # refuses to load against any other; consumers on a different mujoco
+    # version fall back to the sdist and build from source.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      # sdist only, on purpose: the native extension is compiled against the
-      # mujoco version present at build time and refuses to load against any
-      # other, so prebuilt wheels would bind consumers to one MuJoCo release.
-      - run: uv build --sdist
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+      - run: uv pip install --system "mujoco==${{ env.MUJOCO_VERSION }}" pybind11 numpy setuptools wheel
+      - run: uv build --no-build-isolation --wheel --out-dir dist
+      - if: matrix.os == 'ubuntu-latest' && matrix.python == '3.13'
+        run: uv build --sdist --out-dir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}-${{ matrix.python }}
+          path: dist/
+
+  publish:
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # trusted publishing (no API token stored in GitHub)
+    environment: testpypi
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
+          repository-url: https://test.pypi.org/legacy/
           skip-existing: true
