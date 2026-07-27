@@ -79,7 +79,7 @@ MuJoCoUni has its own package version, independent of the MuJoCo solver version.
 Current release:
 
 ```text
-mujoco-uni-runtime==0.2.1
+mujoco-uni-runtime==0.2.2
 mujoco>=3.5,<3.11
 ```
 
@@ -234,7 +234,7 @@ Returned model views remain valid only while the pool is alive.
 
 ## Installation
 
-MuJoCoUni is published on PyPI as `mujoco-uni-runtime` (source distribution):
+MuJoCoUni is published as `mujoco-uni-runtime` (**source distribution only**):
 
 ```bash
 pip install "mujoco>=3.5,<3.11" pybind11 numpy setuptools wheel
@@ -244,16 +244,26 @@ pip install mujoco-uni-runtime --no-build-isolation
 There are no prebuilt wheels on purpose: the native extension is compiled
 against the `mujoco` package present at build time and refuses to load against
 any other MuJoCo version, so a prebuilt wheel would silently bind you to one
-MuJoCo release. Building from source requires a C++17 toolchain. Install with
-`--no-build-isolation` (as above) so the extension is compiled against the
-`mujoco` version of your target environment instead of a throwaway isolated
-one.
+MuJoCo release. Install with `--no-build-isolation` (as above) so the
+extension is compiled against the `mujoco` version of your target environment
+instead of a throwaway isolated one.
+
+### Prerequisites
+
+Building from source requires:
+
+- a **C++17 toolchain** — macOS: Xcode Command Line Tools (`xcode-select --install`);
+  Debian/Ubuntu: `sudo apt install build-essential`; Windows: MSVC Build Tools
+- **Python development headers** — Debian/Ubuntu system Python:
+  `sudo apt install python3-dev` (or `python3.X-dev` matching your version).
+  Not needed when using a uv-managed Python (`uv python install`), which
+  bundles the headers and is the recommended option.
 
 uv projects declare the same setup:
 
 ```toml
 [project.optional-dependencies]
-mujoco = ["mujoco>=3.5,<3.11", "mujoco-uni-runtime==0.2.1", "pybind11>=2.12", "wheel"]
+mujoco = ["mujoco>=3.5,<3.11", "mujoco-uni-runtime==0.2.2", "pybind11>=2.12", "wheel"]
 
 [tool.uv]
 no-build-isolation-package = ["mujoco-uni-runtime"]

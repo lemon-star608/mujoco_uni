@@ -23,8 +23,8 @@
 #include <thread>
 #include <vector>
 
-#include <absl/base/attributes.h>
-
+// NOTE: upstream keeps `#include <absl/base/attributes.h>` here and
+// ABSL_CONST_INIT on worker_id_; dropped to avoid the Abseil dependency.
 namespace mujoco::python {
 
 // ThreadPool class
@@ -64,7 +64,7 @@ class ThreadPool {
   // execute task with available thread
   void WorkerThread(int i);
 
-  ABSL_CONST_INIT static thread_local int worker_id_;
+  static thread_local int worker_id_;
 
   // ----- members ----- //
   std::vector<std::thread> threads_;

@@ -76,7 +76,7 @@ MuJoCoUni 拥有自己的包版本，独立于 MuJoCo 求解器版本。
 当前发布版本：
 
 ```text
-mujoco-uni-runtime==0.2.1
+mujoco-uni-runtime==0.2.2
 mujoco>=3.5,<3.11
 ```
 
@@ -209,20 +209,27 @@ kd
 
 ## 安装
 
-MuJoCoUni 以 `mujoco-uni-runtime` 之名发布在 PyPI 上（源码分发 sdist）：
+MuJoCoUni 以 `mujoco-uni-runtime` 之名发布（**仅源码分发 sdist**）：
 
 ```bash
 pip install "mujoco>=3.5,<3.11" pybind11 numpy setuptools wheel
 pip install mujoco-uni-runtime --no-build-isolation
 ```
 
-刻意不提供预编译 wheel：原生扩展针对构建时环境中的 `mujoco` 编译，且拒绝在其它 MuJoCo 版本下加载，预编译 wheel 会把你隐式绑定到某一个 MuJoCo 版本。从源码构建需要 C++17 工具链。请使用 `--no-build-isolation`（如上），使扩展针对目标环境中的 `mujoco` 版本编译，而不是一次性的隔离构建环境。
+刻意不提供预编译 wheel：原生扩展针对构建时环境中的 `mujoco` 编译，且拒绝在其它 MuJoCo 版本下加载，预编译 wheel 会把你隐式绑定到某一个 MuJoCo 版本。请使用 `--no-build-isolation`（如上），使扩展针对目标环境中的 `mujoco` 版本编译，而不是一次性的隔离构建环境。
+
+### 前置要求
+
+从源码构建需要：
+
+- **C++17 工具链** —— macOS：Xcode Command Line Tools（`xcode-select --install`）；Debian/Ubuntu：`sudo apt install build-essential`；Windows：MSVC Build Tools
+- **Python 开发头文件** —— 使用 Debian/Ubuntu 系统 Python 时：`sudo apt install python3-dev`（或与你的版本对应的 `python3.X-dev`）。使用 uv 托管的 Python（`uv python install`）则自带头文件，无需此步，也是推荐方式。
 
 uv 项目以声明式达到同样效果：
 
 ```toml
 [project.optional-dependencies]
-mujoco = ["mujoco>=3.5,<3.11", "mujoco-uni-runtime==0.2.1", "pybind11>=2.12", "wheel"]
+mujoco = ["mujoco>=3.5,<3.11", "mujoco-uni-runtime==0.2.2", "pybind11>=2.12", "wheel"]
 
 [tool.uv]
 no-build-isolation-package = ["mujoco-uni-runtime"]

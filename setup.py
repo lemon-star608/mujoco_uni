@@ -61,9 +61,6 @@ class BuildExt(build_ext):
                     numpy.get_include(),
                     str(mujoco_dir / "include"),
                     str(Path(__file__).resolve().parent / "src" / "mujoco_uni" / "native"),
-                    # compat/ provides a minimal absl shim so upstream
-                    # threadpool.{h,cc} stay byte-identical with official MuJoCo.
-                    str(Path(__file__).resolve().parent / "src" / "mujoco_uni" / "native" / "compat"),
                 ]
             )
             ext.define_macros.append(

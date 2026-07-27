@@ -20,11 +20,11 @@
 #include <thread>
 #include <utility>
 
-#include <absl/base/attributes.h>
-
+// NOTE: upstream keeps `#include <absl/base/attributes.h>` here and
+// ABSL_CONST_INIT on worker_id_; dropped to avoid the Abseil dependency.
 namespace mujoco::python {
 
-ABSL_CONST_INIT thread_local int ThreadPool::worker_id_ = -1;
+thread_local int ThreadPool::worker_id_ = -1;
 
 // ThreadPool constructor
 ThreadPool::ThreadPool(int num_threads) : ctr_(0) {

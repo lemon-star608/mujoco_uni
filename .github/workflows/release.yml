@@ -6,33 +6,24 @@ on:
   workflow_dispatch:
     inputs:
       mujoco_version:
-        description: MuJoCo version to build the wheels against
+        description: MuJoCo version used for the build/test matrix
         required: true
-        default: "3.10.0"
+        default: "3.8.0"
 
 env:
-  MUJOCO_VERSION: ${{ inputs.mujoco_version || '3.10.0' }}
+  MUJOCO_VERSION: ${{ inputs.mujoco_version || '3.8.0' }}
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv venv
-      - run: uv pip install "mujoco==${{ env.MUJOCO_VERSION }}" pybind11 numpy pytest setuptools wheel
-      - run: uv pip install --no-build-isolation -e .
-      - run: .venv/bin/python -m pytest tests/ -q
-
-  build:
-    # The native extension links against the mujoco wheel of MUJOCO_VERSION and
-    # refuses to load against any other; consumers on a different mujoco
-    # version fall back to the sdist and build from source.
+  # Verify that the sdist compiles and passes tests on every supported
+  # platform. Nothing but the sdist is published: the native extension is
+  # bound to the mujoco version present at build time, so prebuilt wheels
+  # would silently pin consumers to one MuJoCo release.
+  build-and-test:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
-        python: ["3.10", "3.11", "3.12", "3.13"]
+        python: ["3.10", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -42,17 +33,19 @@ jobs:
           python-version: ${{ matrix.python }}
       - uses: ilammy/msvc-dev-cmd@v1
         if: runner.os == 'Windows'
-      - run: uv pip install --system "mujoco==${{ env.MUJOCO_VERSION }}" pybind11 numpy setuptools wheel
-      - run: uv build --no-build-isolation --wheel --out-dir dist
-      - if: matrix.os == 'ubuntu-latest' && matrix.python == '3.13'
-        run: uv build --sdist --out-dir dist
+      - run: uv pip install --system "mujoco==${{ env.MUJOCO_VERSION }}" pybind11 numpy pytest setuptools wheel
+      - run: uv build --sdist --out-dir dist
+      - name: install from the freshly built sdist
+        run: uv pip install --system --no-build-isolation --no-binary mujoco-uni-runtime --no-cache --find-links dist --no-index mujoco-uni-runtime
+      - run: python -m pytest tests/ -q
       - uses: actions/upload-artifact@v4
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.13'
         with:
-          name: dist-${{ matrix.os }}-${{ matrix.python }}
+          name: sdist
           path: dist/
 
   publish:
-    needs: [test, build]
+    needs: build-and-test
     runs-on: ubuntu-latest
     permissions:
       id-token: write # trusted publishing (no API token stored in GitHub)
@@ -60,9 +53,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: dist-*
+          name: sdist
           path: dist
-          merge-multiple: true
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: https://test.pypi.org/legacy/
