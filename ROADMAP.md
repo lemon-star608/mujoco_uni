@@ -17,7 +17,7 @@ Scope:
 - pool-owned copied `mjModel` objects,
 - reusable per-worker `mjData`,
 - batched `step`, `forward`, `reset`, sensor collection, randomization fields,
-  site Jacobian, hfield height, and multi-ray queries.
+  site Jacobian, and hfield height queries.
 
 ## v0.2: Explicit MuJoCo Version Selection
 
@@ -38,19 +38,19 @@ Scope:
 - add a native build-version watchdog to catch stale compiled extensions,
 - avoid requiring users to store multiple MuJoCo source repositories,
 - fail fast when the loaded `mujoco` package does not match the native adapter.
-- `v0.2.1`: align with upstream `uni/v3.8.0` server-performance commits by
-  adding optional Linux worker pinning, partitioned NUMA scheduling, and
-  first-touch `mjData` allocation without changing solver internals.
+- `v0.2.1`: align `BatchEnvPool` behavior with the upstream MuJoCo reference
+  implementation (multimodel pools, 9 randomization fields, no server NUMA
+  scheduling, no batched multi-ray) without changing solver internals.
 
 Target user model:
 
 ```text
-env-mj35  -> mujoco==3.5.x  -> mujoco-uni adapter for 3.5
-env-mj36  -> mujoco==3.6.x  -> mujoco-uni adapter for 3.6
-env-mj37  -> mujoco==3.7.x  -> mujoco-uni adapter for 3.7
-env-mj38  -> mujoco==3.8.x  -> mujoco-uni adapter for 3.8
-env-mj39  -> mujoco==3.9.x  -> mujoco-uni adapter for 3.9
-env-mj310 -> mujoco==3.10.x -> mujoco-uni adapter for 3.10
+env-mj35  -> mujoco==3.5.x  -> mujoco-uni-runtime adapter for 3.5
+env-mj36  -> mujoco==3.6.x  -> mujoco-uni-runtime adapter for 3.6
+env-mj37  -> mujoco==3.7.x  -> mujoco-uni-runtime adapter for 3.7
+env-mj38  -> mujoco==3.8.x  -> mujoco-uni-runtime adapter for 3.8
+env-mj39  -> mujoco==3.9.x  -> mujoco-uni-runtime adapter for 3.9
+env-mj310 -> mujoco==3.10.x -> mujoco-uni-runtime adapter for 3.10
 ```
 
 ## v0.3: MuJoCo mjThreadPool Adaptation

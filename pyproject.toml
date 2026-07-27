@@ -9,7 +9,7 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mujoco-uni"
+name = "mujoco-uni-runtime"
 version = "0.2.1"
 description = "Standalone MuJoCoUni batched executor layer"
 readme = "README.md"

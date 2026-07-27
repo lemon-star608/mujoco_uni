@@ -1,5 +1,7 @@
 # MuJoCoUni
 
+English | [简体中文](README_zh.md)
+
 MuJoCoUni is the standalone UniLab batch-executor layer for official MuJoCo.
 It provides the `BatchEnvPool` API used by UniLab without modifying MuJoCo
 solver, contact, integrator, or source-tree internals.
@@ -77,7 +79,7 @@ MuJoCoUni has its own package version, independent of the MuJoCo solver version.
 Current release:
 
 ```text
-mujoco-uni==0.2.1
+mujoco-uni-runtime==0.2.1
 mujoco>=3.5,<3.11
 ```
 
@@ -102,12 +104,12 @@ before Python imports `mujoco`. Normal training launch does not create, install,
 or rebuild environments.
 
 ```text
-env-mj35  -> mujoco==3.5.x  -> build/install mujoco-uni
-env-mj36  -> mujoco==3.6.x  -> build/install mujoco-uni
-env-mj37  -> mujoco==3.7.x  -> build/install mujoco-uni
-env-mj38  -> mujoco==3.8.x  -> build/install mujoco-uni
-env-mj39  -> mujoco==3.9.x  -> build/install mujoco-uni
-env-mj310 -> mujoco==3.10.x -> build/install mujoco-uni
+env-mj35  -> mujoco==3.5.x  -> build/install mujoco-uni-runtime
+env-mj36  -> mujoco==3.6.x  -> build/install mujoco-uni-runtime
+env-mj37  -> mujoco==3.7.x  -> build/install mujoco-uni-runtime
+env-mj38  -> mujoco==3.8.x  -> build/install mujoco-uni-runtime
+env-mj39  -> mujoco==3.9.x  -> build/install mujoco-uni-runtime
+env-mj310 -> mujoco==3.10.x -> build/install mujoco-uni-runtime
 ```
 
 Default and fallback selection prefer discovered environments in this order:
@@ -187,17 +189,6 @@ The hot path is native C++ calling the official MuJoCo C API. The pool uses:
 - disjoint output slots,
 - one synchronization point per batch operation.
 
-Server NUMA controls are available for large CPU machines:
-
-- `numa_policy="off"` keeps the historical unpinned local thread pool,
-- `numa_policy="pin"` pins each worker to an explicit CPU id on Linux,
-- `numa_policy="partitioned"` splits the environment range into contiguous
-  partitions, each with its own worker pool and `mjData` segment,
-- `first_touch=True` allocates worker `mjData` on the worker that will use it.
-
-These controls affect worker placement and memory locality. They do not alter
-the MuJoCo solver or split one MuJoCo environment solve across threads.
-
 There is no MPI or OpenMP inside the base `BatchEnvPool` executor. Large-scale
 multi-process, multi-socket, or multi-node collection composes multiple local
 executors from a layer above `BatchEnvPool`.
@@ -236,7 +227,6 @@ Core `BatchEnvPool` behavior:
 - sparse `reset` with optional model-field randomization,
 - site Jacobian queries,
 - hfield height sampling,
-- multi-ray queries when supported by the native extension,
 - non-owning model views through `get_model`, `get_models`, and
   `get_all_models`.
 
@@ -244,22 +234,37 @@ Returned model views remain valid only while the pool is alive.
 
 ## Installation
 
+MuJoCoUni is published on PyPI as `mujoco-uni-runtime` (source distribution):
+
+```bash
+pip install "mujoco>=3.5,<3.11" pybind11 numpy setuptools wheel
+pip install mujoco-uni-runtime --no-build-isolation
+```
+
+There are no prebuilt wheels on purpose: the native extension is compiled
+against the `mujoco` package present at build time and refuses to load against
+any other MuJoCo version, so a prebuilt wheel would silently bind you to one
+MuJoCo release. Building from source requires a C++17 toolchain. Install with
+`--no-build-isolation` (as above) so the extension is compiled against the
+`mujoco` version of your target environment instead of a throwaway isolated
+one.
+
+uv projects declare the same setup:
+
+```toml
+[project.optional-dependencies]
+mujoco = ["mujoco>=3.5,<3.11", "mujoco-uni-runtime==0.2.1", "pybind11>=2.12", "wheel"]
+
+[tool.uv]
+no-build-isolation-package = ["mujoco-uni-runtime"]
+```
+
 For development beside UniLab:
 
 ```bash
 cd /path/to/mujoco_uni
 uv sync
 uv pip install --force-reinstall --no-deps --no-build-isolation -e .
-```
-
-For a UniLab checkout using this sibling repository:
-
-```toml
-[project.optional-dependencies]
-mujoco = ["mujoco-uni==0.2.1"]
-
-[tool.uv.sources]
-mujoco-uni = { path = "../mujoco_uni" }
 ```
 
 UniLab imports through its compatibility/backend layer, which in turn imports:
