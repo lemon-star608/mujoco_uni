@@ -1,0 +1,34 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv venv
+      - run: uv pip install "mujoco==3.10.0" pybind11 numpy pytest setuptools wheel
+      - run: uv pip install --no-build-isolation -e .
+      - run: .venv/bin/python -m pytest tests/ -q
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # trusted publishing (no API token stored in GitHub)
+    environment: pypi
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      # sdist only, on purpose: the native extension is compiled against the
+      # mujoco version present at build time and refuses to load against any
+      # other, so prebuilt wheels would bind consumers to one MuJoCo release.
+      - run: uv build --sdist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
