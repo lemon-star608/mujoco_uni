@@ -130,11 +130,6 @@ def _normalize_scalar_int(name: str, value) -> int:
   return int(value)
 
 
-def _validate_chunk_size(chunk_size: Optional[int]) -> None:
-  if chunk_size is not None and chunk_size <= 0:
-    raise ValueError("chunk_size must be positive")
-
-
 def _normalize_indexed_value(name: str, scalar_index: bool, nindex: int, value):
   width = _FIELD_COMPONENT_WIDTHS[name]
   arr = np.asarray(value, dtype=np.float64)
@@ -155,10 +150,6 @@ def _normalize_indexed_value(name: str, scalar_index: bool, nindex: int, value):
   return np.ascontiguousarray(arr.reshape(-1), dtype=np.float64)
 
 
-_VALID_NUMA_POLICIES = ("off", "pin", "partitioned")
-_PARTITION_KEYS = frozenset({"env_start", "env_end", "cpu_ids", "nthread"})
-
-
 class BatchEnvPool:
   """Persistent per-environment model pool with step / forward / reset."""
 
@@ -168,10 +159,6 @@ class BatchEnvPool:
       *,
       nbatch: int,
       nthread: Optional[int] = None,
-      numa_policy: str = "off",
-      cpu_ids: Optional[Sequence[int]] = None,
-      first_touch: bool = True,
-      partitions: Optional[Sequence[Dict[str, Any]]] = None,
   ):
     """Construct a batch pool from one model or a compatible model sequence.
 
@@ -179,157 +166,15 @@ class BatchEnvPool:
       model: A single ``MjModel`` to clone across the pool, or a compatible
         sequence of ``MjModel`` instances with length ``1`` or ``nbatch``.
       nbatch: Number of environments in the pool.
-      nthread: Number of worker threads. ``None`` means ``0``. Ignored (and
-        derived from ``partitions``) when ``numa_policy='partitioned'``.
-      numa_policy: ``"off"`` (default) leaves worker CPU affinity untouched.
-        ``"pin"`` pins worker ``i`` to ``cpu_ids[i]`` on Linux via
-        ``pthread_setaffinity_np``; other platforms silently no-op.
-        ``"partitioned"`` splits ``[0, nbatch)`` into contiguous env ranges,
-        each served by its own pinned ThreadPool and NUMA-local mjData
-        (see ``partitions``).
-      cpu_ids: Optional length-``nthread`` sequence of CPU ids. Required
-        when ``numa_policy='pin'``, must be omitted otherwise. Must be omitted
-        when ``numa_policy='partitioned'`` (specify cpu_ids per partition).
-      first_touch: When true (default), each worker allocates its own mjData
-        on the thread/CPU it runs on so that (under pinning) the memory is
-        NUMA-local. When false, mjData is allocated on the constructing
-        thread. Numerically identical either way.
-      partitions: Required when ``numa_policy='partitioned'``: a sequence of
-        dicts, each ``{'env_start', 'env_end', 'cpu_ids', 'nthread'}``. The
-        env ranges must be contiguous and cover ``[0, nbatch)`` exactly; each
-        partition pins ``nthread`` workers to its ``cpu_ids``. Must be omitted
-        for other policies.
+      nthread: Number of worker threads. ``None`` means ``0``.
     """
     if nbatch <= 0:
       raise ValueError("nbatch must be positive")
     if not isinstance(model, mujoco.MjModel):
       model = list(model)
     self._nthread = 0 if nthread is None else int(nthread)
-
-    if numa_policy not in _VALID_NUMA_POLICIES:
-      raise ValueError(
-          f"numa_policy must be one of {_VALID_NUMA_POLICIES}, "
-          f"got {numa_policy!r}"
-      )
-
-    if numa_policy != "partitioned" and partitions is not None:
-      raise ValueError(
-          "partitions is only valid with numa_policy='partitioned'"
-      )
-
-    cpu_ids_list: list[int] = []
-    # Flat partition arrays passed to the native constructor (empty unless
-    # partitioned). cpu_ids of all partitions are concatenated; the native
-    # side re-slices them by part_nthreads.
-    part_env_starts: list[int] = []
-    part_env_ends: list[int] = []
-    part_nthreads: list[int] = []
-    part_cpu_ids_flat: list[int] = []
-    self._partitions: tuple[Dict[str, Any], ...] = ()
-
-    if numa_policy == "pin":
-      if self._nthread <= 0:
-        raise ValueError("numa_policy='pin' requires nthread > 0")
-      if cpu_ids is None:
-        raise ValueError("numa_policy='pin' requires cpu_ids")
-      cpu_ids_list = [int(c) for c in cpu_ids]
-      if len(cpu_ids_list) != self._nthread:
-        raise ValueError(
-            f"cpu_ids must have length nthread={self._nthread}, "
-            f"got {len(cpu_ids_list)}"
-        )
-      if any(c < 0 for c in cpu_ids_list):
-        raise ValueError("cpu_ids must be non-negative")
-    elif numa_policy == "partitioned":
-      if cpu_ids is not None:
-        raise ValueError(
-            "top-level cpu_ids is not allowed with numa_policy='partitioned'; "
-            "specify cpu_ids per partition"
-        )
-      if partitions is None:
-        raise ValueError(
-            "numa_policy='partitioned' requires a partitions list"
-        )
-      partitions = list(partitions)
-      if not partitions:
-        raise ValueError(
-            "numa_policy='partitioned' requires a non-empty partitions list"
-        )
-      normalized: list[Dict[str, Any]] = []
-      prev_end = 0
-      for i, part in enumerate(partitions):
-        if not isinstance(part, dict) or set(part.keys()) != _PARTITION_KEYS:
-          raise ValueError(
-              f"partition {i} must be a dict with keys "
-              f"{sorted(_PARTITION_KEYS)}"
-          )
-        env_start = int(part["env_start"])
-        env_end = int(part["env_end"])
-        nt = int(part["nthread"])
-        pcpu = [int(c) for c in part["cpu_ids"]]
-        if i == 0 and env_start != 0:
-          raise ValueError(
-              f"partitions must start at env 0, got env_start={env_start}"
-          )
-        if env_start >= env_end:
-          raise ValueError(
-              f"partition {i} has empty/negative range "
-              f"[{env_start}, {env_end})"
-          )
-        if i > 0 and env_start != prev_end:
-          raise ValueError(
-              f"partition {i} env_start={env_start} must equal previous "
-              f"env_end={prev_end} (ranges must be contiguous, no gaps or "
-              f"overlaps)"
-          )
-        if nt <= 0:
-          raise ValueError(f"partition {i} requires nthread > 0")
-        if len(pcpu) != nt:
-          raise ValueError(
-              f"partition {i} cpu_ids length {len(pcpu)} must equal "
-              f"nthread {nt}"
-          )
-        if any(c < 0 for c in pcpu):
-          raise ValueError(f"partition {i} cpu_ids must be non-negative")
-        prev_end = env_end
-        part_env_starts.append(env_start)
-        part_env_ends.append(env_end)
-        part_nthreads.append(nt)
-        part_cpu_ids_flat.extend(pcpu)
-        normalized.append({
-            "env_start": env_start,
-            "env_end": env_end,
-            "nthread": nt,
-            "cpu_ids": tuple(pcpu),
-        })
-      if prev_end != nbatch:
-        raise ValueError(
-            f"partitions must cover [0, nbatch={nbatch}); last "
-            f"env_end={prev_end}"
-        )
-      # nthread reflects the total worker count across all partitions.
-      self._nthread = int(sum(part_nthreads))
-      self._partitions = tuple(normalized)
-    elif cpu_ids is not None:
-      raise ValueError(
-          "cpu_ids is only meaningful when numa_policy='pin'"
-      )
-
-    self._numa_policy = numa_policy
-    self._cpu_ids: tuple[int, ...] = tuple(cpu_ids_list)
-    self._first_touch = bool(first_touch)
-
     self._pool = _native.BatchEnvPool(
-        model=model,
-        nbatch=int(nbatch),
-        nthread=self._nthread,
-        numa_policy=self._numa_policy,
-        cpu_ids=cpu_ids_list,
-        first_touch=self._first_touch,
-        part_env_starts=part_env_starts,
-        part_env_ends=part_env_ends,
-        part_nthreads=part_nthreads,
-        part_cpu_ids_flat=part_cpu_ids_flat,
+        model=model, nbatch=int(nbatch), nthread=self._nthread
     )
 
   def __enter__(self) -> "BatchEnvPool":
@@ -363,40 +208,6 @@ class BatchEnvPool:
   @property
   def nsensordata(self) -> int:
     return self._pool.nsensordata
-
-  @property
-  def numa_policy(self) -> str:
-    return self._numa_policy
-
-  @property
-  def cpu_ids(self) -> tuple[int, ...]:
-    return self._cpu_ids
-
-  @property
-  def first_touch(self) -> bool:
-    return self._first_touch
-
-  @property
-  def worker_affinities(self) -> tuple[tuple[int, ...], ...]:
-    """Observed per-worker CPU affinity mask, as read from the OS.
-
-    Empty tuple means "no affinity information available": either
-    ``numa_policy != 'pin'``, ``nthread == 0``, or the platform has no
-    affinity API. On Linux with ``numa_policy='pin'``, construction fails
-    if the kernel rejects the requested pinning.
-    """
-    if self._pool is None:
-      raise RuntimeError("worker_affinities requested after pool close")
-    return tuple(tuple(mask) for mask in self._pool.worker_affinities)
-
-  @property
-  def partitions(self) -> tuple[Dict[str, Any], ...]:
-    """Effective execution partitions.
-
-    Empty for ``numa_policy != 'partitioned'``. For ``'partitioned'`` each
-    entry is ``{'env_start', 'env_end', 'nthread', 'cpu_ids'}``.
-    """
-    return self._partitions
 
   def get_all_models(self) -> list[mujoco.MjModel]:
     """Return pool-owned models without copying.
@@ -474,7 +285,6 @@ class BatchEnvPool:
       initial_warmstart = np.ascontiguousarray(
           initial_warmstart, dtype=np.float64
       )
-    _validate_chunk_size(chunk_size)
 
     return self._pool.step(
         nstep=int(nstep),
@@ -522,7 +332,6 @@ class BatchEnvPool:
       initial_warmstart = np.ascontiguousarray(
           initial_warmstart, dtype=np.float64
       )
-    _validate_chunk_size(chunk_size)
 
     return self._pool.forward(
         state0=initial_state,
@@ -577,7 +386,6 @@ class BatchEnvPool:
       initial_warmstart = np.ascontiguousarray(
           initial_warmstart, dtype=np.float64
       )
-    _validate_chunk_size(chunk_size)
 
     site_ids_arr, scalar_index = _normalize_indices(site_ids)
 
@@ -649,7 +457,8 @@ class BatchEnvPool:
 
     hfield_geom_id = _normalize_scalar_int("hfield_geom_id", hfield_geom_id)
     frame_body_id = _normalize_scalar_int("frame_body_id", frame_body_id)
-    _validate_chunk_size(chunk_size)
+    if chunk_size is not None and chunk_size <= 0:
+      raise ValueError("chunk_size must be positive")
     alignment = str(alignment).lower()
     output = str(output).lower()
 
@@ -660,117 +469,6 @@ class BatchEnvPool:
         frame_body_id=frame_body_id,
         alignment=alignment,
         output=output,
-        chunk_size=chunk_size,
-    )
-
-  # -- batched multi-ray --------------------------------------------
-  def multi_ray(
-      self,
-      initial_state,
-      pnt,
-      vec,
-      *,
-      geomgroup=None,
-      flg_static: int = 1,
-      bodyexclude: int | Sequence[int] = -1,
-      return_normal: bool = False,
-      cutoff: float = float(mujoco.mjMAXVAL),
-      chunk_size: Optional[int] = None,
-  ):
-    """Run ``mj_multiRay`` over the full env pool in parallel.
-
-    Per environment this sets ``initial_state`` on the pool-owned model/data,
-    runs the minimum position-stage prefix required by MuJoCo ray casting, and
-    then calls ``mj_multiRay`` once for that environment.
-
-    Args:
-      initial_state: ``(nbatch, nstate)`` full-physics states.
-      pnt: ray origins, shape ``(3,)`` shared across envs or
-        ``(nbatch, 3)`` per environment.
-      vec: ray directions, shape ``(nray, 3)`` shared across envs or
-        ``(nbatch, nray, 3)`` per environment.
-      geomgroup: optional geom visibility mask with shape ``(mjNGROUP,)``.
-      flg_static: forwarded to ``mj_multiRay``.
-      bodyexclude: scalar body id shared across envs or ``(nbatch,)``.
-      return_normal: whether to return surface normals.
-      cutoff: forwarded to ``mj_multiRay``.
-      chunk_size: thread-pool chunk size, optional.
-
-    Returns:
-      ``(dist, geomid, normal)`` where ``dist`` and ``geomid`` have shape
-      ``(nbatch, nray)`` and ``normal`` is either ``None`` or
-      ``(nbatch, nray, 3)``.
-    """
-    if self._pool is None:
-      raise RuntimeError("multi_ray requested after pool close")
-
-    initial_state = np.ascontiguousarray(initial_state, dtype=np.float64)
-    if initial_state.shape != (self.nbatch, self.nstate):
-      raise ValueError(
-          f"initial_state must have shape (nbatch={self.nbatch}, "
-          f"nstate={self.nstate}), got {initial_state.shape}"
-      )
-
-    pnt = np.ascontiguousarray(pnt, dtype=np.float64)
-    if pnt.shape != (3,) and pnt.shape != (self.nbatch, 3):
-      raise ValueError(
-          f"pnt must have shape (3,) or (nbatch={self.nbatch}, 3), "
-          f"got {pnt.shape}"
-      )
-
-    vec = np.ascontiguousarray(vec, dtype=np.float64)
-    if vec.ndim == 2:
-      if vec.shape[1] != 3:
-        raise ValueError(f"vec must have shape (nray, 3), got {vec.shape}")
-    elif vec.ndim == 3:
-      if vec.shape[0] != self.nbatch or vec.shape[2] != 3:
-        raise ValueError(
-            f"vec must have shape (nray, 3) or (nbatch={self.nbatch}, nray, 3), "
-            f"got {vec.shape}"
-        )
-    else:
-      raise ValueError(
-          f"vec must have shape (nray, 3) or (nbatch={self.nbatch}, nray, 3), "
-          f"got {vec.shape}"
-      )
-    if vec.shape[-2] == 0:
-      raise ValueError("vec must contain at least one ray")
-
-    if geomgroup is not None:
-      geomgroup = np.ascontiguousarray(geomgroup, dtype=np.uint8)
-      if geomgroup.shape != (mujoco.mjNGROUP,):
-        raise ValueError(
-            f"geomgroup must have shape ({mujoco.mjNGROUP},), got {geomgroup.shape}"
-        )
-
-    if isinstance(bodyexclude, (bool, np.bool_)):
-      raise TypeError("bodyexclude must be an integer id or a 1-D integer array")
-    if isinstance(bodyexclude, numbers.Integral):
-      bodyexclude = np.asarray([int(bodyexclude)], dtype=np.int32)
-    else:
-      arr = np.asarray(bodyexclude)
-      if arr.dtype.kind not in ("i", "u"):
-        raise TypeError("bodyexclude must contain integers")
-      bodyexclude = np.ascontiguousarray(arr, dtype=np.int32)
-      if bodyexclude.ndim != 1:
-        raise ValueError(f"bodyexclude must be 1-D, got {bodyexclude.shape}")
-      if bodyexclude.shape[0] not in (1, self.nbatch):
-        raise ValueError(
-            f"bodyexclude must have shape (1,) or (nbatch={self.nbatch},), "
-            f"got {bodyexclude.shape}"
-        )
-
-    _validate_chunk_size(chunk_size)
-
-    return self._pool.multi_ray(
-        state0=initial_state,
-        pnt=pnt,
-        vec=vec,
-        geomgroup=geomgroup,
-        flg_static=int(flg_static),
-        bodyexclude=bodyexclude,
-        return_normal=bool(return_normal),
-        cutoff=float(cutoff),
         chunk_size=chunk_size,
     )
 
@@ -817,7 +515,6 @@ class BatchEnvPool:
       initial_warmstart = np.ascontiguousarray(
           initial_warmstart, dtype=np.float64
       )
-    _validate_chunk_size(chunk_size)
 
     if randomization is not None:
       unknown = [k for k in randomization if k not in SUPPORTED_FIELDS]

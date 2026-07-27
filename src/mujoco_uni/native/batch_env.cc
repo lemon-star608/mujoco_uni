@@ -60,7 +60,6 @@ namespace {
 namespace py = ::pybind11;
 using PyCArray = py::array_t<mjtNum, py::array::c_style>;
 using PyIArray = py::array_t<int, py::array::c_style>;
-using PyBArray = py::array_t<mjtByte, py::array::c_style>;
 
 namespace raw {
 using MjModel = ::mjModel;
@@ -685,57 +684,41 @@ void _unsafe_step(const std::vector<const raw::MjModel*>& m, raw::MjData* d,
   }
 }
 
-// Submit (but do NOT wait for) step jobs over the ABSOLUTE env range
-// [env_begin, env_end) to `pool`. Resets `pool`'s completion counter and
-// schedules the jobs, returning the number scheduled. The caller must call
-// pool->WaitCount(njobs) afterwards. Splitting submit from wait lets the
-// partitioned dispatch push jobs to every partition's pool first and only
-// then barrier on all of them — if each partition waited before the next was
-// submitted, the partitions would run serially and Phase 2 would yield no
-// throughput gain.
-//
-// Env indices are absolute: _unsafe_step indexes m[r], state0 + r*nstate,
-// state_out + r*nstate by absolute env id, so each env writes its correct
-// global row with no per-partition offset arithmetic on the buffers. `d` is
-// the partition's own worker_data segment; d[pool->WorkerId()] selects that
-// worker's mjData (WorkerId() is the pool-local index).
-int _unsafe_step_submit(const std::vector<const raw::MjModel*>& m,
-                        std::vector<raw::MjData*>& d, int env_begin,
-                        int env_end, int nstep, unsigned int control_spec,
-                        const mjtNum* state0, const mjtNum* warmstart0,
-                        const mjtNum* control, mjtNum* state_out,
-                        mjtNum* sensordata_out, bool post_step_forward_sensor,
-                        ThreadPool* pool, int chunk_size,
-                        bool control_is_constant) {
-  int n = env_end - env_begin;
-  int nfulljobs = n / chunk_size;
-  int chunk_remainder = n % chunk_size;
+void _unsafe_step_threaded(const std::vector<const raw::MjModel*>& m,
+                           std::vector<raw::MjData*>& d, int nbatch, int nstep,
+                           unsigned int control_spec, const mjtNum* state0,
+                           const mjtNum* warmstart0, const mjtNum* control,
+                           mjtNum* state_out, mjtNum* sensordata_out,
+                           bool post_step_forward_sensor, ThreadPool* pool,
+                           int chunk_size, bool control_is_constant) {
+  int nfulljobs = nbatch / chunk_size;
+  int chunk_remainder = nbatch % chunk_size;
   int njobs = (chunk_remainder > 0) ? nfulljobs + 1 : nfulljobs;
 
   pool->ResetCount();
 
   for (int j = 0; j < nfulljobs; j++) {
-    int lo = env_begin + j * chunk_size;
-    int hi = lo + chunk_size;
     auto task = [=, &m, &d](void) {
-      _unsafe_step(m, d[pool->WorkerId()], lo, hi, nstep, control_spec, state0,
-                   warmstart0, control, state_out, sensordata_out,
-                   post_step_forward_sensor, control_is_constant);
+      int id = pool->WorkerId();
+      _unsafe_step(m, d[id], j * chunk_size, (j + 1) * chunk_size, nstep,
+                   control_spec, state0, warmstart0, control, state_out,
+                   sensordata_out, post_step_forward_sensor,
+                   control_is_constant);
     };
     pool->Schedule(task);
   }
   if (chunk_remainder > 0) {
-    int lo = env_begin + nfulljobs * chunk_size;
-    int hi = env_end;
     auto task = [=, &m, &d](void) {
-      _unsafe_step(m, d[pool->WorkerId()], lo, hi, nstep, control_spec, state0,
-                   warmstart0, control, state_out, sensordata_out,
-                   post_step_forward_sensor, control_is_constant);
+      _unsafe_step(m, d[pool->WorkerId()], nfulljobs * chunk_size,
+                   nfulljobs * chunk_size + chunk_remainder, nstep,
+                   control_spec, state0, warmstart0, control, state_out,
+                   sensordata_out, post_step_forward_sensor,
+                   control_is_constant);
     };
     pool->Schedule(task);
   }
 
-  return njobs;
+  pool->WaitCount(njobs);
 }
 
 // Subset reset kernel. Iterates over env_ids[start, end), applies per-env
@@ -899,41 +882,38 @@ void _unsafe_full_forward_range(const std::vector<raw::MjModel*>& models,
   }
 }
 
-// Submit (but do NOT wait for) full-forward jobs over the ABSOLUTE env range
-// [env_begin, env_end). See _unsafe_step_submit for the submit/wait rationale.
-int _unsafe_full_forward_submit(const std::vector<raw::MjModel*>& models,
-                                std::vector<raw::MjData*>& d, int env_begin,
-                                int env_end, const mjtNum* state0,
-                                const mjtNum* warmstart0,
-                                mjtNum* sensordata_out, int skipsensor,
-                                ThreadPool* pool, int chunk_size) {
-  int n = env_end - env_begin;
-  int nfulljobs = n / chunk_size;
-  int chunk_remainder = n % chunk_size;
+void _unsafe_full_forward_threaded(const std::vector<raw::MjModel*>& models,
+                                   std::vector<raw::MjData*>& d, int nbatch,
+                                   const mjtNum* state0,
+                                   const mjtNum* warmstart0,
+                                   mjtNum* sensordata_out, int skipsensor,
+                                   ThreadPool* pool, int chunk_size) {
+  int nfulljobs = nbatch / chunk_size;
+  int chunk_remainder = nbatch % chunk_size;
   int njobs = (chunk_remainder > 0) ? nfulljobs + 1 : nfulljobs;
 
   pool->ResetCount();
 
   for (int j = 0; j < nfulljobs; j++) {
-    int lo = env_begin + j * chunk_size;
-    int hi = lo + chunk_size;
     auto task = [=, &models, &d](void) {
-      _unsafe_full_forward_range(models, d[pool->WorkerId()], lo, hi, state0,
-                                 warmstart0, sensordata_out, skipsensor);
+      int id = pool->WorkerId();
+      _unsafe_full_forward_range(models, d[id], j * chunk_size,
+                                 (j + 1) * chunk_size, state0, warmstart0,
+                                 sensordata_out, skipsensor);
     };
     pool->Schedule(task);
   }
   if (chunk_remainder > 0) {
-    int lo = env_begin + nfulljobs * chunk_size;
-    int hi = env_end;
     auto task = [=, &models, &d](void) {
-      _unsafe_full_forward_range(models, d[pool->WorkerId()], lo, hi, state0,
-                                 warmstart0, sensordata_out, skipsensor);
+      _unsafe_full_forward_range(
+          models, d[pool->WorkerId()], nfulljobs * chunk_size,
+          nfulljobs * chunk_size + chunk_remainder, state0, warmstart0,
+          sensordata_out, skipsensor);
     };
     pool->Schedule(task);
   }
 
-  return njobs;
+  pool->WaitCount(njobs);
 }
 
 // Site-Jacobian kernel. Per env: setState, run kinematics + comPos prefix
@@ -1026,95 +1006,6 @@ void _unsafe_jacobians_threaded(const std::vector<raw::MjModel*>& models,
           models, d[pool->WorkerId()], nfulljobs * chunk_size,
           nfulljobs * chunk_size + chunk_remainder, state0, warmstart0,
           site_ids, nsite_query, jacp_out, jacr_out);
-    };
-    pool->Schedule(task);
-  }
-
-  pool->WaitCount(njobs);
-}
-
-// Batched multi-ray kernel. Per env: set full-physics state, run the
-// position-stage prefix needed by mj_multiRay (geom_xpos/xmat, xipos), then
-// cast nray rays from either a shared or per-env origin and direction bundle.
-void _unsafe_multi_ray_range(
-    const std::vector<raw::MjModel*>& models, raw::MjData* d, int start,
-    int end, const mjtNum* state0, const mjtNum* pnt, bool pnt_batched,
-    const mjtNum* vec, bool vec_batched, const mjtByte* geomgroup,
-    mjtByte flg_static, const int* bodyexclude, bool bodyexclude_batched,
-    int nray, mjtNum cutoff, int* geomid_out, mjtNum* dist_out,
-    mjtNum* normal_out) {
-  const raw::MjModel* m0 = models[0];
-  size_t nstate = static_cast<size_t>(mj_stateSize(m0, mjSTATE_FULLPHYSICS));
-  int nbody = m0->nbody;
-  size_t ray_block = static_cast<size_t>(nray);
-  size_t vec_block = 3 * ray_block;
-
-  for (int r = start; r < end; ++r) {
-    raw::MjModel* me = models[r];
-
-    for (int i = 0; i < nbody; i++) {
-      int id = me->body_mocapid[i];
-      if (id >= 0) {
-        mju_copy3(d->mocap_pos + 3 * id, me->body_pos + 3 * i);
-        mju_copy4(d->mocap_quat + 4 * id, me->body_quat + 4 * i);
-      }
-    }
-
-    mj_setState(me, d, state0 + static_cast<size_t>(r) * nstate,
-                mjSTATE_FULLPHYSICS);
-
-    // Minimum position-stage prefix that mj_multiRay reads:
-    //   geom_xpos/xmat ← mj_kinematics
-    //   xipos          ← mj_comPos
-    mj_kinematics(me, d);
-    mj_comPos(me, d);
-
-    const mjtNum* pnt_env =
-        pnt + (pnt_batched ? static_cast<size_t>(r) * 3 : 0);
-    const mjtNum* vec_env =
-        vec + (vec_batched ? static_cast<size_t>(r) * vec_block : 0);
-    int bodyexclude_env = bodyexclude[bodyexclude_batched ? r : 0];
-    int* geomid_env = geomid_out + static_cast<size_t>(r) * ray_block;
-    mjtNum* dist_env = dist_out + static_cast<size_t>(r) * ray_block;
-    mjtNum* normal_env =
-        normal_out ? normal_out + static_cast<size_t>(r) * vec_block : nullptr;
-
-    mj_multiRay(me, d, pnt_env, vec_env, geomgroup, flg_static,
-                bodyexclude_env, geomid_env, dist_env, normal_env, nray,
-                cutoff);
-  }
-}
-
-void _unsafe_multi_ray_threaded(
-    const std::vector<raw::MjModel*>& models, std::vector<raw::MjData*>& d,
-    int nbatch, const mjtNum* state0, const mjtNum* pnt, bool pnt_batched,
-    const mjtNum* vec, bool vec_batched, const mjtByte* geomgroup,
-    mjtByte flg_static, const int* bodyexclude, bool bodyexclude_batched,
-    int nray, mjtNum cutoff, int* geomid_out, mjtNum* dist_out,
-    mjtNum* normal_out, ThreadPool* pool, int chunk_size) {
-  int nfulljobs = nbatch / chunk_size;
-  int chunk_remainder = nbatch % chunk_size;
-  int njobs = (chunk_remainder > 0) ? nfulljobs + 1 : nfulljobs;
-
-  pool->ResetCount();
-
-  for (int j = 0; j < nfulljobs; j++) {
-    auto task = [=, &models, &d](void) {
-      int id = pool->WorkerId();
-      _unsafe_multi_ray_range(
-          models, d[id], j * chunk_size, (j + 1) * chunk_size, state0, pnt,
-          pnt_batched, vec, vec_batched, geomgroup, flg_static, bodyexclude,
-          bodyexclude_batched, nray, cutoff, geomid_out, dist_out, normal_out);
-    };
-    pool->Schedule(task);
-  }
-  if (chunk_remainder > 0) {
-    auto task = [=, &models, &d](void) {
-      _unsafe_multi_ray_range(
-          models, d[pool->WorkerId()], nfulljobs * chunk_size,
-          nfulljobs * chunk_size + chunk_remainder, state0, pnt, pnt_batched,
-          vec, vec_batched, geomgroup, flg_static, bodyexclude,
-          bodyexclude_batched, nray, cutoff, geomid_out, dist_out, normal_out);
     };
     pool->Schedule(task);
   }
@@ -1278,209 +1169,15 @@ mjtNum* required_array_ptr(const PyCArray& arr, const char* name,
 // Pool.
 // ===================================================================
 
-// A contiguous env range [env_start, env_end) served by its own ThreadPool
-// and its own segment of mjData. Every numa_policy is represented as a vector
-// of Partitions: 'off'/'pin' produce exactly one Partition covering the whole
-// batch (so the dispatch loop degenerates to the historical single-pool path);
-// 'partitioned' produces N. Default work stealing across partitions is not
-// possible because each partition has a private pool + queue.
-struct Partition {
-  int env_start = 0;  // absolute, inclusive
-  int env_end = 0;    // absolute, exclusive
-  int nthread = 0;    // worker count for this partition's pool
-  std::vector<int> cpu_ids;             // empty unless pinning
-  std::shared_ptr<ThreadPool> pool;     // null iff nthread == 0
-  // This partition's own mjData, one per worker. INVARIANT: indexed by the
-  // owning pool's local ThreadPool::WorkerId() (0..nthread-1). Because a
-  // physical thread belongs to exactly one ThreadPool, worker_data[WorkerId()]
-  // never aliases another partition's data. If ThreadPool is ever refactored
-  // to share threads across pools, this indexing breaks.
-  std::vector<raw::MjData*> worker_data;
-};
-
-// Partitioned step dispatch. Submits each partition's jobs to its OWN pool
-// first (so all pools run concurrently), then barriers on all of them. Doing a
-// per-partition WaitCount before submitting the next partition would serialize
-// the partitions and negate Phase 2's purpose. For off/pin (single partition)
-// this reduces to the historical submit-then-wait on one pool.
-void _unsafe_step_partitioned(
-    std::vector<Partition>& partitions,
-    const std::vector<const raw::MjModel*>& m, int nstep,
-    unsigned int control_spec, const mjtNum* state0, const mjtNum* warmstart0,
-    const mjtNum* control, mjtNum* state_out, mjtNum* sensordata_out,
-    bool post_step_forward_sensor, std::optional<int> chunk_size,
-    bool control_is_constant) {
-  int P = static_cast<int>(partitions.size());
-  std::vector<int> njobs(P);
-  for (int k = 0; k < P; ++k) {
-    Partition& p = partitions[k];
-    int pn = p.env_end - p.env_start;
-    int chunk = chunk_size.has_value()
-                    ? *chunk_size
-                    : std::max(1, pn / (10 * p.nthread));
-    njobs[k] = _unsafe_step_submit(
-        m, p.worker_data, p.env_start, p.env_end, nstep, control_spec, state0,
-        warmstart0, control, state_out, sensordata_out, post_step_forward_sensor,
-        p.pool.get(), chunk, control_is_constant);
-  }
-  for (int k = 0; k < P; ++k) {
-    partitions[k].pool->WaitCount(njobs[k]);
-  }
-}
-
-// Partitioned full-forward dispatch. Same submit-all-then-wait-all structure.
-void _unsafe_full_forward_partitioned(
-    std::vector<Partition>& partitions,
-    const std::vector<raw::MjModel*>& models, const mjtNum* state0,
-    const mjtNum* warmstart0, mjtNum* sensordata_out, int skipsensor,
-    std::optional<int> chunk_size) {
-  int P = static_cast<int>(partitions.size());
-  std::vector<int> njobs(P);
-  for (int k = 0; k < P; ++k) {
-    Partition& p = partitions[k];
-    int pn = p.env_end - p.env_start;
-    int chunk = chunk_size.has_value()
-                    ? *chunk_size
-                    : std::max(1, pn / (10 * p.nthread));
-    njobs[k] = _unsafe_full_forward_submit(
-        models, p.worker_data, p.env_start, p.env_end, state0, warmstart0,
-        sensordata_out, skipsensor, p.pool.get(), chunk);
-  }
-  for (int k = 0; k < P; ++k) {
-    partitions[k].pool->WaitCount(njobs[k]);
-  }
-}
-
 class BatchEnvPool {
  public:
-  BatchEnvPool(py::object model_obj, int nbatch, int nthread,
-               const std::string& numa_policy, std::vector<int> cpu_ids,
-               bool first_touch, std::vector<int> part_env_starts,
-               std::vector<int> part_env_ends, std::vector<int> part_nthreads,
-               std::vector<int> part_cpu_ids_flat)
-      : nbatch_(nbatch),
-        nthread_(nthread),
-        numa_policy_(numa_policy),
-        first_touch_(first_touch) {
+  BatchEnvPool(py::object model_obj, int nbatch, int nthread)
+      : nbatch_(nbatch), nthread_(nthread) {
     if (nbatch_ <= 0) {
       throw py::value_error("nbatch must be positive");
     }
     if (nthread_ < 0) {
       throw py::value_error("nthread must be >= 0");
-    }
-
-    // ---- Validate numa_policy and build partition specs. ----
-    // Every policy is normalized to a list of contiguous env-range specs;
-    // off/pin produce exactly one covering [0, nbatch), 'partitioned' N.
-    struct PartSpec {
-      int env_start;
-      int env_end;
-      int nthread;
-      std::vector<int> cpu_ids;
-    };
-    std::vector<PartSpec> specs;
-
-    if (numa_policy_ == "off" || numa_policy_ == "pin") {
-      if (numa_policy_ == "pin") {
-        if (nthread_ == 0) {
-          throw py::value_error("numa_policy='pin' requires nthread > 0");
-        }
-        if (static_cast<int>(cpu_ids.size()) != nthread_) {
-          throw py::value_error(
-              "numa_policy='pin' requires cpu_ids of length nthread");
-        }
-        for (int cpu : cpu_ids) {
-          if (cpu < 0) {
-            throw py::value_error("cpu_ids must be non-negative");
-          }
-        }
-      } else if (!cpu_ids.empty()) {
-        throw py::value_error(
-            "cpu_ids is only meaningful when numa_policy='pin'");
-      }
-      if (!part_env_starts.empty()) {
-        throw py::value_error(
-            "partitions is only valid with numa_policy='partitioned'");
-      }
-      specs.push_back({0, nbatch_, nthread_, std::move(cpu_ids)});
-    } else if (numa_policy_ == "partitioned") {
-      // Defensive re-validation of the flat arrays normalized in Python.
-      if (!cpu_ids.empty()) {
-        throw py::value_error(
-            "top-level cpu_ids is not allowed with numa_policy='partitioned'; "
-            "specify cpu_ids per partition");
-      }
-      int P = static_cast<int>(part_env_starts.size());
-      if (P == 0) {
-        throw py::value_error(
-            "numa_policy='partitioned' requires a non-empty partitions list");
-      }
-      if (static_cast<int>(part_env_ends.size()) != P ||
-          static_cast<int>(part_nthreads.size()) != P) {
-        throw py::value_error(
-            "partition arrays (env_starts, env_ends, nthreads) must have equal "
-            "length");
-      }
-      if (part_env_starts[0] != 0) {
-        throw py::value_error("partitions must start at env 0, got env_start=" +
-                              std::to_string(part_env_starts[0]));
-      }
-      if (part_env_ends[P - 1] != nbatch_) {
-        throw py::value_error(
-            "partitions must cover [0, nbatch=" + std::to_string(nbatch_) +
-            "); last env_end=" + std::to_string(part_env_ends[P - 1]));
-      }
-      long total_threads = 0;
-      size_t cpu_consumed = 0;
-      for (int k = 0; k < P; ++k) {
-        int s = part_env_starts[k];
-        int e = part_env_ends[k];
-        int nt = part_nthreads[k];
-        if (s >= e) {
-          throw py::value_error("partition " + std::to_string(k) +
-                                " has empty/negative range [" +
-                                std::to_string(s) + ", " + std::to_string(e) +
-                                ")");
-        }
-        if (k > 0 && s != part_env_ends[k - 1]) {
-          throw py::value_error(
-              "partition " + std::to_string(k) + " env_start=" +
-              std::to_string(s) + " must equal previous env_end=" +
-              std::to_string(part_env_ends[k - 1]) +
-              " (ranges must be contiguous, no gaps or overlaps)");
-        }
-        if (nt <= 0) {
-          throw py::value_error("partition " + std::to_string(k) +
-                                " requires nthread > 0");
-        }
-        if (cpu_consumed + static_cast<size_t>(nt) > part_cpu_ids_flat.size()) {
-          throw py::value_error(
-              "partition cpu_ids flat array is shorter than the sum of "
-              "partition nthreads");
-        }
-        std::vector<int> pcpu(
-            part_cpu_ids_flat.begin() + cpu_consumed,
-            part_cpu_ids_flat.begin() + cpu_consumed + nt);
-        cpu_consumed += nt;
-        for (int cpu : pcpu) {
-          if (cpu < 0) {
-            throw py::value_error("partition " + std::to_string(k) +
-                                  " cpu_ids must be non-negative");
-          }
-        }
-        total_threads += nt;
-        specs.push_back({s, e, nt, std::move(pcpu)});
-      }
-      if (cpu_consumed != part_cpu_ids_flat.size()) {
-        throw py::value_error(
-            "partition cpu_ids flat array length does not match the sum of "
-            "partition nthreads");
-      }
-      // nthread reflects the total worker count across all partitions.
-      nthread_ = static_cast<int>(total_threads);
-    } else {
-      throw py::value_error(
-          "numa_policy must be one of {'off', 'pin', 'partitioned'}");
     }
 
     std::vector<const raw::MjModel*> src_models =
@@ -1527,59 +1224,27 @@ class BatchEnvPool {
       }
     }
 
-    // ---- Build partitions: one ThreadPool + one worker_data segment each. ----
-    // reserve() so references into partitions_ stay valid across RunOnEachWorker.
-    partitions_.reserve(specs.size());
-    for (PartSpec& spec : specs) {
-      Partition p;
-      p.env_start = spec.env_start;
-      p.env_end = spec.env_end;
-      p.nthread = spec.nthread;
-      p.cpu_ids = std::move(spec.cpu_ids);
-      partitions_.push_back(std::move(p));
+    int ndata = nthread_ > 0 ? nthread_ : 1;
+    worker_data_.resize(ndata, nullptr);
+    for (int t = 0; t < ndata; ++t) {
+      worker_data_[t] = mj_makeData(largest_model);
+      if (worker_data_[t] == nullptr) {
+        for (int j = 0; j < t; ++j) {
+          mj_deleteData(worker_data_[j]);
+          worker_data_[j] = nullptr;
+        }
+        for (raw::MjModel* m : owned_models_) {
+          if (m) mj_deleteModel(m);
+        }
+        owned_models_.clear();
+        model_refcounts_.clear();
+        models_.clear();
+        throw py::value_error("mj_makeData failed while constructing pool");
+      }
     }
 
-    for (Partition& p : partitions_) {
-      try {
-        if (p.nthread > 0) {
-          if (!p.cpu_ids.empty()) {
-            p.pool = std::make_shared<ThreadPool>(p.nthread, p.cpu_ids);
-          } else {
-            p.pool = std::make_shared<ThreadPool>(p.nthread);
-          }
-        }
-      } catch (const std::exception& e) {
-        // A pinned pool whose kernel rejects the affinity request throws.
-        // Tear down all partitions built so far (join their live workers
-        // BEFORE freeing any mjData) plus the owned models, then re-raise as
-        // a Python ValueError.
-        TearDownPartitionsAndModels();
-        throw py::value_error(e.what());
-      }
-
-      int ndata = p.nthread > 0 ? p.nthread : 1;
-      p.worker_data.assign(ndata, nullptr);
-      if (p.nthread > 0 && first_touch_) {
-        // NUMA-local first-touch: each pinned worker allocates its own mjData
-        // on the CPU/node it will run on. RunOnEachWorker forces a 1:1
-        // worker<->task mapping so every worker id gets exactly one segment.
-        std::vector<raw::MjData*>& wd = p.worker_data;
-        const raw::MjModel* lm = largest_model;
-        p.pool->RunOnEachWorker(
-            [&wd, lm](int id) { wd[id] = mj_makeData(lm); });
-      } else {
-        // Single-thread partition, or first_touch disabled: allocate on the
-        // constructing thread (matches historical behavior).
-        for (int t = 0; t < ndata; ++t) {
-          p.worker_data[t] = mj_makeData(largest_model);
-        }
-      }
-      for (int t = 0; t < ndata; ++t) {
-        if (p.worker_data[t] == nullptr) {
-          TearDownPartitionsAndModels();
-          throw py::value_error("mj_makeData failed while constructing pool");
-        }
-      }
+    if (nthread_ > 0) {
+      pool_ = std::make_shared<ThreadPool>(nthread_);
     }
 
     // Cache sizes.
@@ -1588,23 +1253,13 @@ class BatchEnvPool {
     nsensordata_ = models_[0]->nsensordata;
   }
 
-  ~BatchEnvPool() { TearDownPartitionsAndModels(); }
-
-  // Join every partition's workers, free all mjData, then delete owned models.
-  // Ordering is critical: ALL pools must be joined before ANY mjData is freed,
-  // or a still-running worker could touch freed memory. This is also used for
-  // constructor partial-failure cleanup, so tolerate partially-built state.
-  void TearDownPartitionsAndModels() {
-    for (Partition& p : partitions_) {
-      p.pool.reset();
+  ~BatchEnvPool() {
+    // shared_ptr release joins the thread pool before we tear down data.
+    pool_.reset();
+    for (raw::MjData* d : worker_data_) {
+      if (d) mj_deleteData(d);
     }
-    for (Partition& p : partitions_) {
-      for (raw::MjData* d : p.worker_data) {
-        if (d) mj_deleteData(d);
-      }
-      p.worker_data.clear();
-    }
-    partitions_.clear();
+    worker_data_.clear();
     // Only delete unique owned copies, not shared aliases in models_. Models
     // exposed through _from_model_ptr are owned by the cached Python wrapper,
     // so skip manual deletion for those and let the wrappers clear after all
@@ -1713,14 +1368,18 @@ class BatchEnvPool {
     {
       py::gil_scoped_release no_gil;
       if (nthread_ > 0 && nbatch_ > 1) {
-        InterceptMjErrors(_unsafe_step_partitioned)(
-            partitions_, cmodels, nstep, control_spec, state0_ptr,
+        int chunk = chunk_size.has_value()
+                        ? *chunk_size
+                        : std::max(1, nbatch_ / (10 * nthread_));
+        InterceptMjErrors(_unsafe_step_threaded)(
+            cmodels, worker_data_, nbatch_, nstep, control_spec, state0_ptr,
             warmstart0_ptr, control_ptr, state_ptr, sensordata_ptr,
-            post_step_forward_sensor, chunk_size, control_is_constant);
+            post_step_forward_sensor, pool_.get(), chunk,
+            control_is_constant);
       } else {
         InterceptMjErrors(_unsafe_step)(
-            cmodels, partitions_[0].worker_data[0], 0, nbatch_, nstep,
-            control_spec, state0_ptr, warmstart0_ptr, control_ptr, state_ptr,
+            cmodels, worker_data_[0], 0, nbatch_, nstep, control_spec,
+            state0_ptr, warmstart0_ptr, control_ptr, state_ptr,
             sensordata_ptr, post_step_forward_sensor, control_is_constant);
       }
     }
@@ -1761,13 +1420,16 @@ class BatchEnvPool {
     {
       py::gil_scoped_release no_gil;
       if (nthread_ > 0 && nbatch_ > 1) {
-        InterceptMjErrors(_unsafe_full_forward_partitioned)(
-            partitions_, models_, state0_ptr, warmstart0_ptr, sensordata_ptr,
-            skipsensor ? 1 : 0, chunk_size);
+        int chunk = chunk_size.has_value()
+                        ? *chunk_size
+                        : std::max(1, nbatch_ / (10 * nthread_));
+        InterceptMjErrors(_unsafe_full_forward_threaded)(
+            models_, worker_data_, nbatch_, state0_ptr, warmstart0_ptr,
+            sensordata_ptr, skipsensor ? 1 : 0, pool_.get(), chunk);
       } else {
         InterceptMjErrors(_unsafe_full_forward_range)(
-            models_, partitions_[0].worker_data[0], 0, nbatch_, state0_ptr,
-            warmstart0_ptr, sensordata_ptr, skipsensor ? 1 : 0);
+            models_, worker_data_[0], 0, nbatch_, state0_ptr, warmstart0_ptr,
+            sensordata_ptr, skipsensor ? 1 : 0);
       }
     }
 
@@ -1851,181 +1513,21 @@ class BatchEnvPool {
 
     {
       py::gil_scoped_release no_gil;
-      // Out-of-scope for Phase 2 partitioning: runs on partition 0's pool over
-      // the whole batch (single-pool behavior, unchanged for off/pin).
-      Partition& p0 = partitions_[0];
-      if (p0.nthread > 0 && nbatch_ > 1) {
+      if (nthread_ > 0 && nbatch_ > 1) {
         int chunk = chunk_size.has_value()
                         ? *chunk_size
-                        : std::max(1, nbatch_ / (10 * p0.nthread));
+                        : std::max(1, nbatch_ / (10 * nthread_));
         InterceptMjErrors(_unsafe_jacobians_threaded)(
-            models_, p0.worker_data, nbatch_, state0_ptr, warmstart0_ptr,
-            site_ids_ptr, nsite_query, jacp_ptr, jacr_ptr, p0.pool.get(), chunk);
+            models_, worker_data_, nbatch_, state0_ptr, warmstart0_ptr,
+            site_ids_ptr, nsite_query, jacp_ptr, jacr_ptr, pool_.get(), chunk);
       } else {
         InterceptMjErrors(_unsafe_jacobians_range)(
-            models_, p0.worker_data[0], 0, nbatch_, state0_ptr, warmstart0_ptr,
+            models_, worker_data_[0], 0, nbatch_, state0_ptr, warmstart0_ptr,
             site_ids_ptr, nsite_query, jacp_ptr, jacr_ptr);
       }
     }
 
     return py::make_tuple(jacp_obj, jacr_obj);
-  }
-
-  // -----------------------------------------------------------------
-  // Batched mj_multiRay.
-  //
-  //   state0:       (nbatch, nstate)
-  //   pnt:          (3,) or (nbatch, 3)
-  //   vec:          (nray, 3) shared across envs, or (nbatch, nray, 3)
-  //   geomgroup:    optional (mjNGROUP,)
-  //   bodyexclude:  (1,) shared across envs, or (nbatch,)
-  //
-  // Returns (dist, geomid, normal_or_none) where:
-  //   dist:         (nbatch, nray)
-  //   geomid:       (nbatch, nray)
-  //   normal:       (nbatch, nray, 3), optional
-  //
-  // Internally this re-runs only mj_kinematics + mj_comPos per env before
-  // calling mj_multiRay, which is the minimum prefix needed by the ray code.
-  // -----------------------------------------------------------------
-  py::tuple multi_ray(const PyCArray state0, const PyCArray pnt,
-                      const PyCArray vec, std::optional<const PyBArray> geomgroup,
-                      mjtByte flg_static, const PyIArray bodyexclude,
-                      bool return_normal, mjtNum cutoff,
-                      std::optional<int> chunk_size) {
-    if (state0.ndim() != 2 || state0.shape(0) != nbatch_ ||
-        state0.shape(1) != nstate_) {
-      std::ostringstream msg;
-      msg << "state0 must have shape (nbatch=" << nbatch_
-          << ", nstate=" << nstate_ << "), got (";
-      for (int i = 0; i < state0.ndim(); ++i) {
-        msg << state0.shape(i) << (i + 1 < state0.ndim() ? ", " : "");
-      }
-      msg << ")";
-      throw py::value_error(msg.str());
-    }
-    if (pnt.ndim() != 1 && pnt.ndim() != 2) {
-      throw py::value_error("pnt must have shape (3,) or (nbatch, 3)");
-    }
-    bool pnt_batched = pnt.ndim() == 2;
-    if ((!pnt_batched && pnt.shape(0) != 3) ||
-        (pnt_batched &&
-         (pnt.shape(0) != nbatch_ || pnt.shape(1) != 3))) {
-      std::ostringstream msg;
-      msg << "pnt must have shape (3,) or (nbatch=" << nbatch_ << ", 3), got (";
-      for (int i = 0; i < pnt.ndim(); ++i) {
-        msg << pnt.shape(i) << (i + 1 < pnt.ndim() ? ", " : "");
-      }
-      msg << ")";
-      throw py::value_error(msg.str());
-    }
-
-    if (vec.ndim() != 2 && vec.ndim() != 3) {
-      throw py::value_error(
-          "vec must have shape (nray, 3) or (nbatch, nray, 3)");
-    }
-    bool vec_batched = vec.ndim() == 3;
-    int nray = 0;
-    if (!vec_batched) {
-      if (vec.shape(1) != 3) {
-        throw py::value_error("vec must have trailing shape (3,)");
-      }
-      nray = static_cast<int>(vec.shape(0));
-    } else {
-      if (vec.shape(0) != nbatch_ || vec.shape(2) != 3) {
-        std::ostringstream msg;
-        msg << "vec must have shape (nray, 3) or (nbatch=" << nbatch_
-            << ", nray, 3), got (";
-        for (int i = 0; i < vec.ndim(); ++i) {
-          msg << vec.shape(i) << (i + 1 < vec.ndim() ? ", " : "");
-        }
-        msg << ")";
-        throw py::value_error(msg.str());
-      }
-      nray = static_cast<int>(vec.shape(1));
-    }
-    if (nray <= 0) {
-      throw py::value_error("vec must contain at least one ray");
-    }
-    if (chunk_size.has_value() && *chunk_size <= 0) {
-      throw py::value_error("chunk_size must be positive");
-    }
-    if (bodyexclude.ndim() != 1 ||
-        (bodyexclude.shape(0) != 1 && bodyexclude.shape(0) != nbatch_)) {
-      std::ostringstream msg;
-      msg << "bodyexclude must have shape (1,) or (nbatch=" << nbatch_
-          << ",), got (";
-      for (int i = 0; i < bodyexclude.ndim(); ++i) {
-        msg << bodyexclude.shape(i)
-            << (i + 1 < bodyexclude.ndim() ? ", " : "");
-      }
-      msg << ")";
-      throw py::value_error(msg.str());
-    }
-    bool bodyexclude_batched = bodyexclude.shape(0) == nbatch_;
-
-    const mjtByte* geomgroup_ptr = nullptr;
-    if (geomgroup.has_value()) {
-      py::buffer_info info = geomgroup->request();
-      if (info.ndim != 1 || info.shape[0] != mjNGROUP) {
-        std::ostringstream msg;
-        msg << "geomgroup must have shape (" << mjNGROUP << ",), got (";
-        for (int i = 0; i < info.ndim; ++i) {
-          msg << info.shape[i] << (i + 1 < info.ndim ? ", " : "");
-        }
-        msg << ")";
-        throw py::value_error(msg.str());
-      }
-      geomgroup_ptr = static_cast<const mjtByte*>(info.ptr);
-    }
-
-    size_t sz_state0 = static_cast<size_t>(nbatch_) * nstate_;
-    size_t sz_pnt = pnt_batched ? static_cast<size_t>(nbatch_) * 3 : 3;
-    size_t sz_vec = vec_batched
-                        ? static_cast<size_t>(nbatch_) * nray * 3
-                        : static_cast<size_t>(nray) * 3;
-    std::optional<PyCArray> state0_opt = state0;
-    mjtNum* state0_ptr = optional_array_ptr(state0_opt, "state0", sz_state0);
-    mjtNum* pnt_ptr = required_array_ptr(pnt, "pnt", sz_pnt);
-    mjtNum* vec_ptr = required_array_ptr(vec, "vec", sz_vec);
-    const int* bodyexclude_ptr = bodyexclude.data();
-
-    PyCArray dist_out({nbatch_, nray});
-    PyIArray geomid_out({nbatch_, nray});
-    mjtNum* dist_ptr = static_cast<mjtNum*>(dist_out.request().ptr);
-    int* geomid_ptr = static_cast<int*>(geomid_out.request().ptr);
-
-    py::object normal_obj = py::none();
-    mjtNum* normal_ptr = nullptr;
-    if (return_normal) {
-      PyCArray arr({nbatch_, nray, 3});
-      normal_ptr = static_cast<mjtNum*>(arr.request().ptr);
-      normal_obj = std::move(arr);
-    }
-
-    {
-      py::gil_scoped_release no_gil;
-      // Out-of-scope for Phase 2 partitioning: runs on partition 0's pool.
-      Partition& p0 = partitions_[0];
-      if (p0.nthread > 0 && nbatch_ > 1) {
-        int chunk = chunk_size.has_value()
-                        ? *chunk_size
-                        : std::max(1, nbatch_ / (10 * p0.nthread));
-        InterceptMjErrors(_unsafe_multi_ray_threaded)(
-            models_, p0.worker_data, nbatch_, state0_ptr, pnt_ptr, pnt_batched,
-            vec_ptr, vec_batched, geomgroup_ptr, flg_static, bodyexclude_ptr,
-            bodyexclude_batched, nray, cutoff, geomid_ptr, dist_ptr, normal_ptr,
-            p0.pool.get(), chunk);
-      } else {
-        InterceptMjErrors(_unsafe_multi_ray_range)(
-            models_, p0.worker_data[0], 0, nbatch_, state0_ptr, pnt_ptr,
-            pnt_batched, vec_ptr, vec_batched, geomgroup_ptr, flg_static,
-            bodyexclude_ptr, bodyexclude_batched, nray, cutoff, geomid_ptr,
-            dist_ptr, normal_ptr);
-      }
-    }
-
-    return py::make_tuple(dist_out, geomid_out, normal_obj);
   }
 
   // -----------------------------------------------------------------
@@ -2096,19 +1598,17 @@ class BatchEnvPool {
 
     {
       py::gil_scoped_release no_gil;
-      // Out-of-scope for Phase 2 partitioning: runs on partition 0's pool.
-      Partition& p0 = partitions_[0];
-      if (p0.nthread > 0 && nbatch_ > 1) {
+      if (nthread_ > 0 && nbatch_ > 1) {
         int chunk = chunk_size.has_value()
                         ? *chunk_size
-                        : std::max(1, nbatch_ / (10 * p0.nthread));
+                        : std::max(1, nbatch_ / (10 * nthread_));
         InterceptMjErrors(_unsafe_hfield_sample_threaded)(
-            models_, p0.worker_data, nbatch_, state0_ptr, hfield_geom_id,
+            models_, worker_data_, nbatch_, state0_ptr, hfield_geom_id,
             offsets_ptr, npoint, frame_body_id, alignment_enum, output_enum,
-            sample_ptr, p0.pool.get(), chunk);
+            sample_ptr, pool_.get(), chunk);
       } else {
         InterceptMjErrors(_unsafe_hfield_sample_range)(
-            models_, p0.worker_data[0], 0, nbatch_, state0_ptr, hfield_geom_id,
+            models_, worker_data_[0], 0, nbatch_, state0_ptr, hfield_geom_id,
             offsets_ptr, npoint, frame_body_id, alignment_enum, output_enum,
             sample_ptr);
       }
@@ -2218,20 +1718,17 @@ class BatchEnvPool {
 
     {
       py::gil_scoped_release no_gil;
-      // Out-of-scope for Phase 2 partitioning: runs on partition 0's pool over
-      // the (non-contiguous) env_ids subset.
-      Partition& p0 = partitions_[0];
-      if (p0.nthread > 0 && n > 1) {
+      if (nthread_ > 0 && n > 1) {
         int chunk = chunk_size.has_value()
                         ? *chunk_size
-                        : std::max(1, n / (10 * p0.nthread));
+                        : std::max(1, n / (10 * nthread_));
         InterceptMjErrors(_unsafe_subset_reset_threaded)(
-            models_, p0.worker_data, env_ids_ptr, n, initial_state_ptr,
+            models_, worker_data_, env_ids_ptr, n, initial_state_ptr,
             initial_warmstart_ptr, refresh_ptr, state_ptr, sensordata_ptr,
-            skipsensor ? 1 : 0, p0.pool.get(), chunk);
+            skipsensor ? 1 : 0, pool_.get(), chunk);
       } else {
         InterceptMjErrors(_unsafe_subset_reset_range)(
-            models_, p0.worker_data[0], env_ids_ptr, 0, n, initial_state_ptr,
+            models_, worker_data_[0], env_ids_ptr, 0, n, initial_state_ptr,
             initial_warmstart_ptr, refresh_ptr, state_ptr, sensordata_ptr,
             skipsensor ? 1 : 0);
       }
@@ -2248,41 +1745,6 @@ class BatchEnvPool {
   int nstate() const { return nstate_; }
   int nv() const { return nv_; }
   int nsensordata() const { return nsensordata_; }
-  const std::string& numa_policy() const { return numa_policy_; }
-  bool first_touch() const { return first_touch_; }
-
-  // Observed CPU affinity mask for each worker thread, as read back from
-  // the OS after pinning. Empty outer list means "no affinity information
-  // available" — either pinning was not requested, nthread == 0, or the
-  // platform has no affinity API (macOS / Windows). Tests can assert
-  // worker_affinities()[i] == [cpu_ids[i]] to verify the kernel actually
-  // pinned worker i to the requested CPU.
-  std::vector<std::vector<int>> worker_affinities() const {
-    // Concatenate partitions in order, so global worker index i maps to the
-    // partition/worker it belongs to. For off/pin (single partition) this is
-    // byte-identical to the Phase 1 behavior. Empty when no pool is pinned.
-    std::vector<std::vector<int>> out;
-    for (const Partition& p : partitions_) {
-      if (!p.pool) continue;
-      for (auto& mask : p.pool->WorkerAffinities()) {
-        out.push_back(mask);
-      }
-    }
-    return out;
-  }
-
-  // Effective partitions. Empty for off/pin (a "partitioned-only" signal,
-  // analogous to cpu_ids being empty for off). Each entry is
-  // (env_start, env_end, nthread, cpu_ids).
-  std::vector<std::tuple<int, int, int, std::vector<int>>> partitions_info()
-      const {
-    std::vector<std::tuple<int, int, int, std::vector<int>>> out;
-    if (numa_policy_ != "partitioned") return out;
-    for (const Partition& p : partitions_) {
-      out.emplace_back(p.env_start, p.env_end, p.nthread, p.cpu_ids);
-    }
-    return out;
-  }
 
   py::object get_model(int env_id) {
     ValidateEnvIdOrThrow(env_id, nbatch_);
@@ -2390,50 +1852,32 @@ class BatchEnvPool {
                         src + static_cast<size_t>(i) * width);
     }
     if (spec.needs_refresh && n > 0) {
-      InterceptMjErrors(mj_setConst)(model, partitions_[0].worker_data[0]);
+      InterceptMjErrors(mj_setConst)(model, worker_data_[0]);
     }
   }
 
  private:
   int nbatch_;
   int nthread_;
-  std::string numa_policy_ = "off";
-  bool first_touch_ = false;
   int nstate_ = 0;
   int nv_ = 0;
   int nsensordata_ = 0;
   std::vector<raw::MjModel*> models_;        // per-env model pointers (may alias)
   std::vector<raw::MjModel*> owned_models_;  // unique copies we own (for cleanup)
   std::unordered_map<raw::MjModel*, int> model_refcounts_;
-  // off/pin: exactly one partition covering [0, nbatch). partitioned: one
-  // private ThreadPool + mjData segment per contiguous env range.
-  std::vector<Partition> partitions_;
+  std::vector<raw::MjData*> worker_data_;
+  std::shared_ptr<ThreadPool> pool_;
   std::unordered_map<raw::MjModel*, py::object> py_model_wrappers_;
   std::unordered_set<raw::MjModel*> py_owned_models_;
 };
 
 PYBIND11_MODULE(_batch_env, pymodule) {
   py::class_<BatchEnvPool>(pymodule, "BatchEnvPool")
-      .def(py::init([](py::object base_model, int nbatch, int nthread,
-                       std::string numa_policy, std::vector<int> cpu_ids,
-                       bool first_touch, std::vector<int> part_env_starts,
-                       std::vector<int> part_env_ends,
-                       std::vector<int> part_nthreads,
-                       std::vector<int> part_cpu_ids_flat) {
-             return std::make_unique<BatchEnvPool>(
-                 base_model, nbatch, nthread, numa_policy, std::move(cpu_ids),
-                 first_touch, std::move(part_env_starts),
-                 std::move(part_env_ends), std::move(part_nthreads),
-                 std::move(part_cpu_ids_flat));
+      .def(py::init([](py::object base_model, int nbatch, int nthread) {
+             return std::make_unique<BatchEnvPool>(base_model, nbatch, nthread);
            }),
            py::kw_only(), py::arg("model"), py::arg("nbatch"),
-           py::arg("nthread"), py::arg("numa_policy") = "off",
-           py::arg("cpu_ids") = std::vector<int>{},
-           py::arg("first_touch") = true,
-           py::arg("part_env_starts") = std::vector<int>{},
-           py::arg("part_env_ends") = std::vector<int>{},
-           py::arg("part_nthreads") = std::vector<int>{},
-           py::arg("part_cpu_ids_flat") = std::vector<int>{})
+           py::arg("nthread"))
       .def("step", &BatchEnvPool::step, py::kw_only(), py::arg("nstep"),
            py::arg("control_spec"), py::arg("state0"),
            py::arg("warmstart0") = py::none(),
@@ -2454,11 +1898,6 @@ PYBIND11_MODULE(_batch_env, pymodule) {
            py::arg("jacp") = true, py::arg("jacr") = false,
            py::arg("warmstart0") = py::none(),
            py::arg("chunk_size") = py::none())
-      .def("multi_ray", &BatchEnvPool::multi_ray, py::kw_only(),
-           py::arg("state0"), py::arg("pnt"), py::arg("vec"),
-           py::arg("geomgroup") = py::none(), py::arg("flg_static") = 1,
-           py::arg("bodyexclude"), py::arg("return_normal") = false,
-           py::arg("cutoff") = mjMAXVAL, py::arg("chunk_size") = py::none())
       .def("sample_hfield_height", &BatchEnvPool::sample_hfield_height,
            py::kw_only(), py::arg("state0"), py::arg("hfield_geom_id"),
            py::arg("offsets"), py::arg("frame_body_id"),
@@ -2478,13 +1917,7 @@ PYBIND11_MODULE(_batch_env, pymodule) {
       .def_property_readonly("nthread", &BatchEnvPool::nthread)
       .def_property_readonly("nstate", &BatchEnvPool::nstate)
       .def_property_readonly("nv", &BatchEnvPool::nv)
-      .def_property_readonly("nsensordata", &BatchEnvPool::nsensordata)
-      .def_property_readonly("numa_policy", &BatchEnvPool::numa_policy)
-      .def_property_readonly("first_touch", &BatchEnvPool::first_touch)
-      .def_property_readonly("worker_affinities",
-                             &BatchEnvPool::worker_affinities)
-      .def_property_readonly("partitions_info",
-                             &BatchEnvPool::partitions_info);
+      .def_property_readonly("nsensordata", &BatchEnvPool::nsensordata);
 
   pymodule.attr("SUPPORTED_FIELDS") = []() {
     py::list out;
