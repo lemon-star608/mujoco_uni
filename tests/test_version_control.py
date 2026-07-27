@@ -58,11 +58,10 @@ def test_discover_mujoco_envs_keeps_venv_python_symlink(
         pytest.skip("symlinks are not available")
 
     env_dir = tmp_path / ".venv-mj310"
-    bin_dir = env_dir / "bin"
-    bin_dir.mkdir(parents=True)
+    venv_python = version_control._python_path(env_dir)
+    venv_python.parent.mkdir(parents=True)
     base_python = tmp_path / "base-python"
     base_python.write_text("")
-    venv_python = bin_dir / "python"
     try:
         venv_python.symlink_to(base_python)
     except OSError:
@@ -97,7 +96,7 @@ def test_run_in_env_uses_existing_explicit_env_dir(
     tmp_path: Path,
 ) -> None:
     env_dir = tmp_path / "custom-env"
-    python = env_dir / "bin" / "python"
+    python = version_control._python_path(env_dir)
     python.parent.mkdir(parents=True)
     python.write_text("")
 
@@ -154,7 +153,7 @@ def test_run_in_env_falls_back_to_existing_env(
     result = run_in_env(["python", "train.py"], version="3.9", env_root=tmp_path)
 
     assert result == 0
-    assert recorded[0][0] == [str(env38 / "bin" / "python"), "train.py"]
+    assert recorded[0][0] == [str(version_control._python_path(env38)), "train.py"]
     assert recorded[0][1][MUJOCO_UNI_VERSION_ENV] == "3.8.1"
     output = capsys.readouterr().out
     assert "requested mujoco '3.9' was not found" in output
@@ -193,7 +192,7 @@ def test_run_in_env_skips_unusable_requested_env(
     monkeypatch.setattr(version_control.subprocess, "run", fake_subprocess_run)
 
     assert run_in_env(["python", "train.py"], version="3.10", env_root=tmp_path) == 0
-    assert recorded == [[str(env38 / "bin" / "python"), "train.py"]]
+    assert recorded == [[str(version_control._python_path(env38)), "train.py"]]
     assert "requested mujoco '3.10' was found but unusable" in capsys.readouterr().out
 
 
@@ -204,7 +203,7 @@ def test_run_in_env_fails_when_no_env_exists(tmp_path: Path) -> None:
 
 def _make_env(root: Path, name: str) -> Path:
     env_dir = root / name
-    python = env_dir / "bin" / "python"
+    python = version_control._python_path(env_dir)
     python.parent.mkdir(parents=True)
     python.write_text("")
     return env_dir
