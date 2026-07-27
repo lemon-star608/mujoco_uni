@@ -49,7 +49,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       id-token: write # trusted publishing (no API token stored in GitHub)
-    environment: testpypi
+    environment: pypi
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -57,5 +57,4 @@ jobs:
           path: dist
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          repository-url: https://test.pypi.org/legacy/
           skip-existing: true

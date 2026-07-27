@@ -76,7 +76,7 @@ MuJoCoUni 拥有自己的包版本，独立于 MuJoCo 求解器版本。
 当前发布版本：
 
 ```text
-mujoco-uni-runtime==0.2.5
+mujoco-uni-runtime==0.3.0
 mujoco>=3.5,<3.11
 ```
 
@@ -229,7 +229,7 @@ uv 项目以声明式达到同样效果：
 
 ```toml
 [project.optional-dependencies]
-mujoco = ["mujoco>=3.5,<3.11", "mujoco-uni-runtime==0.2.5", "pybind11>=2.12", "wheel"]
+mujoco = ["mujoco>=3.5,<3.11", "mujoco-uni-runtime==0.3.0", "pybind11>=2.12", "wheel"]
 
 [tool.uv]
 no-build-isolation-package = ["mujoco-uni-runtime"]
