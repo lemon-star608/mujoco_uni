@@ -94,6 +94,8 @@ enum class FieldId {
   kGravity,
   kKp,
   kKd,
+  kGeomSize,
+  kGeomPos,
 };
 
 struct FieldSpec {
@@ -112,6 +114,8 @@ constexpr FieldSpec kFieldSpecs[] = {
     {"geom_friction", FieldId::kGeomFriction, false},
     {"kp",            FieldId::kKp,           false},
     {"kd",            FieldId::kKd,           false},
+    {"geom_size",     FieldId::kGeomSize,     true},
+    {"geom_pos",      FieldId::kGeomPos,      true},
 };
 
 // Element count of the field for a given model.
@@ -126,6 +130,8 @@ int FieldSize(FieldId id, const raw::MjModel* m) {
     case FieldId::kGeomFriction: return 3 * m->ngeom;
     case FieldId::kKp:           return m->nu;
     case FieldId::kKd:           return m->nu;
+    case FieldId::kGeomSize:     return 3 * m->ngeom;
+    case FieldId::kGeomPos:      return 3 * m->ngeom;
   }
   return 0;
 }
@@ -136,6 +142,8 @@ int FieldComponentWidth(FieldId id) {
     case FieldId::kBodyInertia:
     case FieldId::kGravity:
     case FieldId::kGeomFriction:
+    case FieldId::kGeomSize:
+    case FieldId::kGeomPos:
       return 3;
     case FieldId::kBodyIquat:
       return 4;
@@ -160,6 +168,8 @@ int FieldIndexCount(FieldId id, const raw::MjModel* m) {
     case FieldId::kGravity:
       return 1;
     case FieldId::kGeomFriction:
+    case FieldId::kGeomSize:
+    case FieldId::kGeomPos:
       return m->ngeom;
     case FieldId::kKp:
     case FieldId::kKd:
@@ -178,6 +188,8 @@ mjtNum* ContiguousFieldPtr(FieldId id, raw::MjModel* m) {
     case FieldId::kDofArmature:  return m->dof_armature;
     case FieldId::kGravity:      return m->opt.gravity;
     case FieldId::kGeomFriction: return m->geom_friction;
+    case FieldId::kGeomSize:     return m->geom_size;
+    case FieldId::kGeomPos:      return m->geom_pos;
     case FieldId::kKp:
     case FieldId::kKd:
       return nullptr;
@@ -198,6 +210,8 @@ void CopyFieldOut(FieldId id, const raw::MjModel* m, mjtNum* dst) {
     case FieldId::kDofArmature:
     case FieldId::kGravity:
     case FieldId::kGeomFriction:
+    case FieldId::kGeomSize:
+    case FieldId::kGeomPos:
       mju_copy(dst, ContiguousFieldPtr(id, m), FieldSize(id, m));
       return;
 
@@ -224,6 +238,8 @@ void WriteField(FieldId id, raw::MjModel* m, const mjtNum* src) {
     case FieldId::kDofArmature:
     case FieldId::kGravity:
     case FieldId::kGeomFriction:
+    case FieldId::kGeomSize:
+    case FieldId::kGeomPos:
       mju_copy(ContiguousFieldPtr(id, m), src, FieldSize(id, m));
       return;
 
@@ -253,6 +269,8 @@ void CopyIndexedFieldOut(FieldId id, const raw::MjModel* m, int index,
     case FieldId::kDofArmature:
     case FieldId::kGravity:
     case FieldId::kGeomFriction:
+    case FieldId::kGeomSize:
+    case FieldId::kGeomPos:
       mju_copy(dst, ContiguousFieldPtr(id, m) + static_cast<size_t>(index) * width,
                width);
       return;

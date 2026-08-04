@@ -105,6 +105,8 @@ _FIELD_COMPONENT_WIDTHS = {
     "geom_friction": 3,
     "kp": 1,
     "kd": 1,
+    "geom_size": 3,
+    "geom_pos": 3,
 }
 
 
