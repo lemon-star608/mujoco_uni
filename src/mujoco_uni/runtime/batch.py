@@ -95,6 +95,32 @@ _check_native_build_compatibility(_native, _runtime_mujoco_version)
 
 
 SUPPORTED_FIELDS = tuple(_native.SUPPORTED_FIELDS)
+
+#: Sentinel stored in the per-env warning arrays when an env raised no warning.
+NO_WARNING: int = int(_native.NO_WARNING)
+
+#: ``mjtWarning`` names indexed by warning id.
+WARNING_NAMES: tuple[str, ...] = tuple(_native.WARNING_NAMES)
+
+#: Warning ids whose MuJoCo check calls ``mj_resetData``, i.e. the ones that
+#: silently teleport an env to the model defaults (``qpos``/``qvel``/``ctrl``
+#: all zeroed) and hand that state back as an ordinary result.
+AUTORESET_WARNINGS: tuple[int, ...] = tuple(int(v) for v in _native.AUTORESET_WARNINGS)
+
+_AUTORESET_WARNINGS_ARR = np.asarray(AUTORESET_WARNINGS, dtype=np.int32)
+
+
+def warning_is_autoreset(warning: np.ndarray) -> np.ndarray:
+    """Map raw warning ids to a boolean "MuJoCo reset this env" mask.
+
+    Args:
+      warning: Integer array of ``mjtWarning`` ids, ``NO_WARNING`` where clean.
+
+    Returns:
+      Boolean array of the same shape, true where the raised warning is one of
+      :data:`AUTORESET_WARNINGS`.
+    """
+    return np.isin(np.asarray(warning), _AUTORESET_WARNINGS_ARR)
 _FIELD_COMPONENT_WIDTHS = {
     "body_mass": 1,
     "body_ipos": 3,
@@ -275,6 +301,67 @@ class BatchEnvPool:
     if self._pool is None:
       raise RuntimeError("worker_cpu_ids requested after pool close")
     return tuple(self._pool.worker_cpu_ids())
+
+  # -- warning observability ------------------------------------------
+  #
+  # MuJoCo does not just log an unstable state: mj_checkPos / mj_checkVel /
+  # mj_checkAcc call mj_resetData, zeroing qpos, qvel and ctrl mid-step. The
+  # kernels then write that post-reset state out as the step result, so without
+  # these accessors a consumer cannot distinguish a teleport from real physics.
+  #
+  # This is an additive surface. ``step`` / ``forward`` / ``reset`` keep their
+  # existing return shapes, so callers that branch on return arity are
+  # unaffected.
+
+  @property
+  def last_step_warning(self) -> np.ndarray:
+    """First ``mjtWarning`` id raised per env during the last :meth:`step`.
+
+    Returns:
+      ``(nbatch,)`` int32 array, :data:`NO_WARNING` where the env was clean.
+      All :data:`NO_WARNING` before the first ``step`` call.
+    """
+    if self._pool is None:
+      raise RuntimeError("last_step_warning requested after pool close")
+    return self._pool.last_step_warning
+
+  @property
+  def last_forward_warning(self) -> np.ndarray:
+    """First ``mjtWarning`` id raised per env during the last :meth:`forward`.
+
+    ``forward`` runs ``mj_forwardSkip``, which does not call the
+    ``mj_checkPos``/``mj_checkVel``/``mj_checkAcc`` trio, so this path cannot
+    autoreset: a bad caller-supplied state passes through untouched. The
+    solver-side ``INERTIA`` / ``CONTACTFULL`` / ``CNSTRFULL`` warnings do reach
+    here.
+    """
+    if self._pool is None:
+      raise RuntimeError("last_forward_warning requested after pool close")
+    return self._pool.last_forward_warning
+
+  @property
+  def last_reset_warning(self) -> np.ndarray:
+    """First ``mjtWarning`` id raised per env during the last :meth:`reset`.
+
+    Env-indexed over the full pool, not indexed by the ``env_ids`` row: envs
+    that the last reset did not touch stay :data:`NO_WARNING`. Same
+    ``mj_forwardSkip`` caveat as :attr:`last_forward_warning` — no autoreset on
+    this path, solver warnings only.
+    """
+    if self._pool is None:
+      raise RuntimeError("last_reset_warning requested after pool close")
+    return self._pool.last_reset_warning
+
+  @property
+  def was_autoreset(self) -> np.ndarray:
+    """Envs that MuJoCo silently reset during the last :meth:`step`.
+
+    Returns:
+      ``(nbatch,)`` bool array. True means the state returned for that env is
+      the post-``mj_resetData`` state, not a continuation of the input state,
+      so any consumer-side cache keyed to the pre-step state is now stale.
+    """
+    return warning_is_autoreset(self.last_step_warning)
 
   def get_all_models(self) -> list[mujoco.MjModel]:
     """Return pool-owned models without copying.

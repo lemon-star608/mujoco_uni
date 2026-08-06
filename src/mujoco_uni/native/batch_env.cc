@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -101,21 +102,22 @@ enum class FieldId {
 struct FieldSpec {
   const char* name;
   FieldId id;
-  bool needs_refresh;  // needs mj_setConst after writing
+  bool needs_refresh;       // needs mj_setConst after writing
+  bool needs_geom_bounds;   // needs geom_rbound/geom_aabb recompute
 };
 
 constexpr FieldSpec kFieldSpecs[] = {
-    {"body_mass",     FieldId::kBodyMass,     true},
-    {"body_ipos",     FieldId::kBodyIpos,     true},
-    {"body_iquat",    FieldId::kBodyIquat,    true},
-    {"body_inertia",  FieldId::kBodyInertia,  true},
-    {"dof_armature",  FieldId::kDofArmature,  true},
-    {"gravity",       FieldId::kGravity,      false},
-    {"geom_friction", FieldId::kGeomFriction, false},
-    {"kp",            FieldId::kKp,           false},
-    {"kd",            FieldId::kKd,           false},
-    {"geom_size",     FieldId::kGeomSize,     true},
-    {"geom_pos",      FieldId::kGeomPos,      true},
+    {"body_mass",     FieldId::kBodyMass,     true,  false},
+    {"body_ipos",     FieldId::kBodyIpos,     true,  false},
+    {"body_iquat",    FieldId::kBodyIquat,    true,  false},
+    {"body_inertia",  FieldId::kBodyInertia,  true,  false},
+    {"dof_armature",  FieldId::kDofArmature,  true,  false},
+    {"gravity",       FieldId::kGravity,      false, false},
+    {"geom_friction", FieldId::kGeomFriction, false, false},
+    {"kp",            FieldId::kKp,           false, false},
+    {"kd",            FieldId::kKd,           false, false},
+    {"geom_size",     FieldId::kGeomSize,     true,  true},
+    {"geom_pos",      FieldId::kGeomPos,      true,  false},
 };
 
 // Element count of the field for a given model.
@@ -285,10 +287,26 @@ void CopyIndexedFieldOut(FieldId id, const raw::MjModel* m, int index,
   }
 }
 
+// Defined below; WriteIndexedField needs it to keep geom bounds in sync with a
+// single-geom geom_size write, mirroring the RefreshAllGeomBounds call that
+// follows the whole-field write path.
+void RefreshGeomBounds(raw::MjModel* m, int geom_id);
+
 void WriteIndexedField(FieldId id, raw::MjModel* m, int index,
                        const mjtNum* src) {
   int width = FieldComponentWidth(id);
   switch (id) {
+    case FieldId::kGeomSize:
+      // geom_rbound / geom_aabb derive from geom_size, so a size write leaves
+      // them stale unless refreshed. Stale rbound means broadphase collision
+      // misses. geom_pos is deliberately absent: RefreshGeomBounds reads only
+      // geom_type and geom_size, and geom_aabb is expressed in the geom's own
+      // frame, so moving a geom cannot change either derived quantity.
+      mju_copy(ContiguousFieldPtr(id, m) + static_cast<size_t>(index) * width, src,
+               width);
+      RefreshGeomBounds(m, index);
+      return;
+
     case FieldId::kBodyMass:
     case FieldId::kBodyIpos:
     case FieldId::kBodyIquat:
@@ -296,6 +314,7 @@ void WriteIndexedField(FieldId id, raw::MjModel* m, int index,
     case FieldId::kDofArmature:
     case FieldId::kGravity:
     case FieldId::kGeomFriction:
+    case FieldId::kGeomPos:
       mju_copy(ContiguousFieldPtr(id, m) + static_cast<size_t>(index) * width, src,
                width);
       return;
@@ -308,6 +327,60 @@ void WriteIndexedField(FieldId id, raw::MjModel* m, int index,
     case FieldId::kKd:
       m->actuator_biasprm[mjNBIAS * index + 2] = -src[0];
       return;
+  }
+}
+
+// Recompute geom_rbound and geom_aabb for one geom after geom_size changed.
+// Only applies to primitives (sphere/capsule/ellipsoid/cylinder/box).
+// Leaves plane/hfield/mesh/sdf bounds untouched (they derive from asset data).
+void RefreshGeomBounds(raw::MjModel* m, int geom_id) {
+  int geom_type = m->geom_type[geom_id];
+  const mjtNum* s = m->geom_size + 3 * geom_id;
+  mjtNum s0 = s[0], s1 = s[1], s2 = s[2];
+  mjtNum* aabb = m->geom_aabb + 6 * geom_id;
+
+  switch (geom_type) {
+    case mjGEOM_SPHERE:  // 2
+      m->geom_rbound[geom_id] = s0;
+      aabb[0] = 0; aabb[1] = 0; aabb[2] = 0;
+      aabb[3] = s0; aabb[4] = s0; aabb[5] = s0;
+      break;
+
+    case mjGEOM_CAPSULE:  // 3
+      m->geom_rbound[geom_id] = s0 + s1;
+      aabb[0] = 0; aabb[1] = 0; aabb[2] = 0;
+      aabb[3] = s0; aabb[4] = s0; aabb[5] = s0 + s1;
+      break;
+
+    case mjGEOM_ELLIPSOID:  // 4
+      m->geom_rbound[geom_id] = mju_max(mju_max(s0, s1), s2);
+      aabb[0] = 0; aabb[1] = 0; aabb[2] = 0;
+      aabb[3] = s0; aabb[4] = s1; aabb[5] = s2;
+      break;
+
+    case mjGEOM_CYLINDER:  // 5
+      m->geom_rbound[geom_id] = mju_sqrt(s0 * s0 + s1 * s1);
+      aabb[0] = 0; aabb[1] = 0; aabb[2] = 0;
+      aabb[3] = s0; aabb[4] = s0; aabb[5] = s1;
+      break;
+
+    case mjGEOM_BOX:  // 6
+      m->geom_rbound[geom_id] = mju_sqrt(s0 * s0 + s1 * s1 + s2 * s2);
+      aabb[0] = 0; aabb[1] = 0; aabb[2] = 0;
+      aabb[3] = s0; aabb[4] = s1; aabb[5] = s2;
+      break;
+
+    // Skip mjGEOM_PLANE (0), mjGEOM_HFIELD (1), mjGEOM_MESH (7), mjGEOM_SDF (8).
+    // Their bounds derive from asset data; leave them untouched.
+    default:
+      break;
+  }
+}
+
+// Refresh bounds for all geoms in the model.
+void RefreshAllGeomBounds(raw::MjModel* m) {
+  for (int g = 0; g < m->ngeom; ++g) {
+    RefreshGeomBounds(m, g);
   }
 }
 
@@ -590,6 +663,200 @@ mjtNum SampleHfieldLocalHeight(const raw::MjModel* m, int hfield_id,
 }
 
 // ===================================================================
+// Per-env field side-table (namespace level).
+// ~6 KB user fields only. Avoids full mj_copyModel (~28 MB) per env.
+// Layout: [geom_size(ngeom*3) | geom_pos(ngeom*3) | body_mass(nbody) |
+//          body_ipos(nbody*3) | body_inertia(nbody*3)]
+// ===================================================================
+
+struct PerEnvFields {
+  std::vector<uint8_t> data;
+  bool needs_patch = true;
+  size_t body_mass_offset = 0, body_mass_bytes = 0;
+  size_t body_ipos_offset = 0, body_ipos_bytes = 0;
+  size_t body_iquat_offset = 0, body_iquat_bytes = 0;
+  size_t body_inertia_offset = 0, body_inertia_bytes = 0;
+  size_t geom_friction_offset = 0, geom_friction_bytes = 0;
+  size_t dof_armature_offset = 0, dof_armature_bytes = 0;
+  size_t gravity_offset = 0, gravity_bytes = 0;
+  size_t kp_offset = 0, kp_bytes = 0;
+  size_t kd_offset = 0, kd_bytes = 0;
+  size_t geom_size_offset = 0, geom_size_bytes = 0;
+  size_t geom_pos_offset = 0, geom_pos_bytes = 0;
+
+  void InitLayout(const raw::MjModel* base) {
+    size_t off = 0;
+    body_mass_offset = off;
+    body_mass_bytes = static_cast<size_t>(base->nbody) * sizeof(mjtNum);
+    off += body_mass_bytes;
+
+    body_ipos_offset = off;
+    body_ipos_bytes = static_cast<size_t>(base->nbody) * 3 * sizeof(mjtNum);
+    off += body_ipos_bytes;
+
+    body_iquat_offset = off;
+    body_iquat_bytes = static_cast<size_t>(base->nbody) * 4 * sizeof(mjtNum);
+    off += body_iquat_bytes;
+
+    body_inertia_offset = off;
+    body_inertia_bytes = static_cast<size_t>(base->nbody) * 3 * sizeof(mjtNum);
+    off += body_inertia_bytes;
+
+    geom_friction_offset = off;
+    geom_friction_bytes = static_cast<size_t>(base->ngeom) * 3 * sizeof(mjtNum);
+    off += geom_friction_bytes;
+
+    dof_armature_offset = off;
+    dof_armature_bytes = static_cast<size_t>(base->nv) * sizeof(mjtNum);
+    off += dof_armature_bytes;
+
+    gravity_offset = off;
+    gravity_bytes = 3 * sizeof(mjtNum);
+    off += gravity_bytes;
+
+    kp_offset = off;
+    kp_bytes = static_cast<size_t>(base->nu) * sizeof(mjtNum);
+    off += kp_bytes;
+
+    kd_offset = off;
+    kd_bytes = static_cast<size_t>(base->nu) * sizeof(mjtNum);
+    off += kd_bytes;
+
+    geom_size_offset = off;
+    geom_size_bytes = static_cast<size_t>(base->ngeom) * 3 * sizeof(mjtNum);
+    off += geom_size_bytes;
+
+    geom_pos_offset = off;
+    geom_pos_bytes = static_cast<size_t>(base->ngeom) * 3 * sizeof(mjtNum);
+    off += geom_pos_bytes;
+
+    data.resize(off);
+    std::memcpy(data.data() + body_mass_offset, base->body_mass, body_mass_bytes);
+    std::memcpy(data.data() + body_ipos_offset, base->body_ipos, body_ipos_bytes);
+    std::memcpy(data.data() + body_iquat_offset, base->body_iquat, body_iquat_bytes);
+    std::memcpy(data.data() + body_inertia_offset, base->body_inertia, body_inertia_bytes);
+    std::memcpy(data.data() + geom_friction_offset, base->geom_friction, geom_friction_bytes);
+    std::memcpy(data.data() + dof_armature_offset, base->dof_armature, dof_armature_bytes);
+    std::memcpy(data.data() + gravity_offset, base->opt.gravity, gravity_bytes);
+    for (int i = 0; i < base->nu; ++i) {
+      reinterpret_cast<mjtNum*>(data.data() + kp_offset)[i] = base->actuator_gainprm[mjNGAIN * i];
+      reinterpret_cast<mjtNum*>(data.data() + kd_offset)[i] = -base->actuator_biasprm[mjNBIAS * i + 2];
+    }
+    std::memcpy(data.data() + geom_size_offset, base->geom_size, geom_size_bytes);
+    std::memcpy(data.data() + geom_pos_offset, base->geom_pos, geom_pos_bytes);
+  }
+
+  // Returns (ptr_into_data, total_bytes) for the given field, or (nullptr, 0) if not stored.
+  std::pair<uint8_t*, size_t> FieldSlot(FieldId id) {
+    switch (id) {
+      case FieldId::kBodyMass:     return {data.data() + body_mass_offset,     body_mass_bytes};
+      case FieldId::kBodyIpos:     return {data.data() + body_ipos_offset,     body_ipos_bytes};
+      case FieldId::kBodyIquat:    return {data.data() + body_iquat_offset,    body_iquat_bytes};
+      case FieldId::kBodyInertia:  return {data.data() + body_inertia_offset,  body_inertia_bytes};
+      case FieldId::kGeomFriction: return {data.data() + geom_friction_offset, geom_friction_bytes};
+      case FieldId::kDofArmature:  return {data.data() + dof_armature_offset,  dof_armature_bytes};
+      case FieldId::kGravity:      return {data.data() + gravity_offset,       gravity_bytes};
+      case FieldId::kGeomSize:     return {data.data() + geom_size_offset,     geom_size_bytes};
+      case FieldId::kGeomPos:      return {data.data() + geom_pos_offset,      geom_pos_bytes};
+      case FieldId::kKp:           return {data.data() + kp_offset,            kp_bytes};
+      case FieldId::kKd:           return {data.data() + kd_offset,            kd_bytes};
+    }
+    return {nullptr, 0};
+  }
+  std::pair<const uint8_t*, size_t> FieldSlot(FieldId id) const {
+    return const_cast<PerEnvFields*>(this)->FieldSlot(id);
+  }
+};
+
+using PerEnvFieldsMap = std::unordered_map<int, PerEnvFields>;
+
+// Apply per-env fields from the side-table into a scratch model.
+// Calls mj_setConst when body fields changed (requires worker MjData).
+// Returns true if any patching was done.
+bool ApplyEnvFieldsToModel(int env_id, const PerEnvFieldsMap& pef,
+                           raw::MjModel* scratch, raw::MjData* d) {
+  auto it = pef.find(env_id);
+  if (it == pef.end()) return false;
+  const PerEnvFields& f = it->second;
+
+  bool body_changed = false;
+  if (f.body_mass_bytes > 0) {
+    std::memcpy(scratch->body_mass, f.data.data() + f.body_mass_offset, f.body_mass_bytes);
+    body_changed = true;
+  }
+  if (f.body_ipos_bytes > 0) {
+    std::memcpy(scratch->body_ipos, f.data.data() + f.body_ipos_offset, f.body_ipos_bytes);
+    body_changed = true;
+  }
+  if (f.body_iquat_bytes > 0) {
+    std::memcpy(scratch->body_iquat, f.data.data() + f.body_iquat_offset, f.body_iquat_bytes);
+    body_changed = true;
+  }
+  if (f.body_inertia_bytes > 0) {
+    std::memcpy(scratch->body_inertia, f.data.data() + f.body_inertia_offset, f.body_inertia_bytes);
+    body_changed = true;
+  }
+  if (f.dof_armature_bytes > 0) {
+    std::memcpy(scratch->dof_armature, f.data.data() + f.dof_armature_offset, f.dof_armature_bytes);
+    body_changed = true;  // dof_armature also needs mj_setConst
+  }
+  if (body_changed) {
+    mj_setConst(scratch, d);
+  }
+  if (f.geom_friction_bytes > 0) {
+    std::memcpy(scratch->geom_friction, f.data.data() + f.geom_friction_offset, f.geom_friction_bytes);
+  }
+  if (f.gravity_bytes > 0) {
+    std::memcpy(scratch->opt.gravity, f.data.data() + f.gravity_offset, f.gravity_bytes);
+  }
+  if (f.kp_bytes > 0) {
+    const mjtNum* kp = reinterpret_cast<const mjtNum*>(f.data.data() + f.kp_offset);
+    for (int i = 0; i < scratch->nu; ++i) {
+      scratch->actuator_gainprm[mjNGAIN * i] = kp[i];
+      scratch->actuator_biasprm[mjNBIAS * i + 1] = -kp[i];
+    }
+  }
+  if (f.kd_bytes > 0) {
+    const mjtNum* kd = reinterpret_cast<const mjtNum*>(f.data.data() + f.kd_offset);
+    for (int i = 0; i < scratch->nu; ++i) {
+      scratch->actuator_biasprm[mjNBIAS * i + 2] = -kd[i];
+    }
+  }
+  if (f.geom_size_bytes > 0) {
+    std::memcpy(scratch->geom_size, f.data.data() + f.geom_size_offset, f.geom_size_bytes);
+    RefreshAllGeomBounds(scratch);
+  }
+  if (f.geom_pos_bytes > 0) {
+    std::memcpy(scratch->geom_pos, f.data.data() + f.geom_pos_offset, f.geom_pos_bytes);
+  }
+  return true;
+}
+
+// ===================================================================
+// Warning observability.
+//
+// MuJoCo does not merely log on an unstable state: mj_checkPos / mj_checkVel /
+// mj_checkAcc call mj_resetData, which zeroes qpos, qvel and ctrl. The kernels
+// below clear d->warning before touching each env, so after the env's work the
+// warning array describes that env alone. Reporting the first raised index lets
+// callers see the teleport instead of consuming the post-reset state as if it
+// were an ordinary step result.
+//
+// Note the warning counter survives mj_resetData, which is what makes this
+// observable at all.
+// ===================================================================
+
+constexpr int32_t kNoWarning = -1;
+
+// Index of the lowest raised mjtWarning, or kNoWarning when the env is clean.
+int32_t FirstRaisedWarning(const raw::MjData* d) {
+  for (int i = 0; i < mjNWARNING; i++) {
+    if (d->warning[i].number) return static_cast<int32_t>(i);
+  }
+  return kNoWarning;
+}
+
+// ===================================================================
 // Kernels — mirror rollout.cc / batch_forward_bind.cc, operating over
 // the pool's owned models/data.
 // ===================================================================
@@ -605,7 +872,13 @@ void _unsafe_step(const std::vector<const raw::MjModel*>& m, raw::MjData* d,
                   unsigned int control_spec, const mjtNum* state0,
                   const mjtNum* warmstart0, const mjtNum* control,
                   mjtNum* state_out, mjtNum* sensordata_out,
-                  bool post_step_forward_sensor, bool control_is_constant) {
+                  bool post_step_forward_sensor, bool control_is_constant,
+                  // Per-env patching (all nullable; if nullptr → use m[r] as-is)
+                  raw::MjModel* scratch_model,
+                  const PerEnvFieldsMap* per_env_fields,
+                  int* cached_env_id,
+                  // Per-env first raised warning index, nullable. (nbatch,)
+                  int32_t* warning_out) {
   size_t nstate = static_cast<size_t>(mj_stateSize(m[0], mjSTATE_FULLPHYSICS));
   size_t ncontrol = static_cast<size_t>(mj_stateSize(m[0], control_spec));
   size_t nv = static_cast<size_t>(m[0]->nv);
@@ -623,25 +896,39 @@ void _unsafe_step(const std::vector<const raw::MjModel*>& m, raw::MjData* d,
   }
 
   for (size_t r = start_roll; r < static_cast<size_t>(end_roll); r++) {
+    // Resolve the model for env r: use scratch if per-env fields exist
+    const raw::MjModel* mr;
+    if (per_env_fields && scratch_model && cached_env_id) {
+      if (*cached_env_id != static_cast<int>(r)) {
+        ApplyEnvFieldsToModel(static_cast<int>(r), *per_env_fields,
+                              scratch_model, d);
+        *cached_env_id = static_cast<int>(r);
+      }
+      auto it2 = per_env_fields->find(static_cast<int>(r));
+      mr = (it2 != per_env_fields->end()) ? scratch_model : m[0];
+    } else {
+      mr = m[r];
+    }
+
     if (!(control_spec & mjSTATE_MOCAP_POS)) {
       for (int i = 0; i < nbody; i++) {
-        int id = m[r]->body_mocapid[i];
-        if (id >= 0) mju_copy3(d->mocap_pos + 3 * id, m[r]->body_pos + 3 * i);
+        int id = mr->body_mocapid[i];
+        if (id >= 0) mju_copy3(d->mocap_pos + 3 * id, mr->body_pos + 3 * i);
       }
     }
     if (!(control_spec & mjSTATE_MOCAP_QUAT)) {
       for (int i = 0; i < nbody; i++) {
-        int id = m[r]->body_mocapid[i];
-        if (id >= 0) mju_copy4(d->mocap_quat + 4 * id, m[r]->body_quat + 4 * i);
+        int id = mr->body_mocapid[i];
+        if (id >= 0) mju_copy4(d->mocap_quat + 4 * id, mr->body_quat + 4 * i);
       }
     }
     if (!(control_spec & mjSTATE_EQ_ACTIVE)) {
       for (int i = 0; i < neq; i++) {
-        d->eq_active[i] = m[r]->eq_active0[i];
+        d->eq_active[i] = mr->eq_active0[i];
       }
     }
 
-    mj_setState(m[r], d, state0 + r * nstate, mjSTATE_FULLPHYSICS);
+    mj_setState(mr, d, state0 + r * nstate, mjSTATE_FULLPHYSICS);
 
     if (warmstart0) {
       mju_copy(d->qacc_warmstart, warmstart0 + r * nv, nv);
@@ -667,35 +954,43 @@ void _unsafe_step(const std::vector<const raw::MjModel*>& m, raw::MjData* d,
         size_t step = control_is_constant
                           ? r
                           : r * static_cast<size_t>(nstep) + t;
-        mj_setState(m[r], d, control + step * ncontrol, control_spec);
+        mj_setState(mr, d, control + step * ncontrol, control_spec);
       }
 
-      mj_step(m[r], d);
+      mj_step(mr, d);
+    }
+
+    // Capture before the post_step_forward_sensor block below clears warnings.
+    // Reading after the loop (not inside it) also catches a warning raised on
+    // the very last substep, where the loop exits on t == nstep rather than on
+    // the abort check.
+    if (warning_out) {
+      warning_out[r] = FirstRaisedWarning(d);
     }
 
     // Write only the final state for this env.
-    mj_getState(m[r], d, state_out + r * nstate, mjSTATE_FULLPHYSICS);
+    mj_getState(mr, d, state_out + r * nstate, mjSTATE_FULLPHYSICS);
     if (sensordata_out) {
       if (post_step_forward_sensor) {
-        mju_zero(d->ctrl, m[r]->nu);
+        mju_zero(d->ctrl, mr->nu);
         mju_zero(d->qfrc_applied, nv);
         mju_zero(d->xfrc_applied, 6 * nbody);
         for (int i = 0; i < nbody; i++) {
-          int id = m[r]->body_mocapid[i];
+          int id = mr->body_mocapid[i];
           if (id >= 0) {
-            mju_copy3(d->mocap_pos + 3 * id, m[r]->body_pos + 3 * i);
-            mju_copy4(d->mocap_quat + 4 * id, m[r]->body_quat + 4 * i);
+            mju_copy3(d->mocap_pos + 3 * id, mr->body_pos + 3 * i);
+            mju_copy4(d->mocap_quat + 4 * id, mr->body_quat + 4 * i);
           }
         }
         for (int i = 0; i < neq; i++) {
-          d->eq_active[i] = m[r]->eq_active0[i];
+          d->eq_active[i] = mr->eq_active0[i];
         }
-        mj_setState(m[r], d, state_out + r * nstate, mjSTATE_FULLPHYSICS);
+        mj_setState(mr, d, state_out + r * nstate, mjSTATE_FULLPHYSICS);
         mju_zero(d->qacc_warmstart, nv);
         for (int i = 0; i < mjNWARNING; i++) {
           d->warning[i].number = 0;
         }
-        mj_forwardSkip(m[r], d, mjSTAGE_NONE, 0);
+        mj_forwardSkip(mr, d, mjSTAGE_NONE, 0);
       }
       mju_copy(sensordata_out + r * nsensordata, d->sensordata, nsensordata);
     }
@@ -708,7 +1003,12 @@ void _unsafe_step_threaded(const std::vector<const raw::MjModel*>& m,
                            const mjtNum* warmstart0, const mjtNum* control,
                            mjtNum* state_out, mjtNum* sensordata_out,
                            bool post_step_forward_sensor, ThreadPool* pool,
-                           int chunk_size, bool control_is_constant) {
+                           int chunk_size, bool control_is_constant,
+                           // Per-env patching (nullable)
+                           std::vector<raw::MjModel*>* scratch_models,
+                           const PerEnvFieldsMap* per_env_fields,
+                           std::vector<int>* cached_env_ids,
+                           int32_t* warning_out) {
   int nfulljobs = nbatch / chunk_size;
   int chunk_remainder = nbatch % chunk_size;
   int njobs = (chunk_remainder > 0) ? nfulljobs + 1 : nfulljobs;
@@ -720,18 +1020,25 @@ void _unsafe_step_threaded(const std::vector<const raw::MjModel*>& m,
       int id = pool->WorkerId();
       _unsafe_step(m, d[id], j * chunk_size, (j + 1) * chunk_size, nstep,
                    control_spec, state0, warmstart0, control, state_out,
-                   sensordata_out, post_step_forward_sensor,
-                   control_is_constant);
+                   sensordata_out, post_step_forward_sensor, control_is_constant,
+                   scratch_models ? (*scratch_models)[id] : nullptr,
+                   per_env_fields,
+                   cached_env_ids ? &(*cached_env_ids)[id] : nullptr,
+                   warning_out);
     };
     pool->Schedule(task);
   }
   if (chunk_remainder > 0) {
     auto task = [=, &m, &d](void) {
-      _unsafe_step(m, d[pool->WorkerId()], nfulljobs * chunk_size,
+      int id = pool->WorkerId();
+      _unsafe_step(m, d[id], nfulljobs * chunk_size,
                    nfulljobs * chunk_size + chunk_remainder, nstep,
                    control_spec, state0, warmstart0, control, state_out,
-                   sensordata_out, post_step_forward_sensor,
-                   control_is_constant);
+                   sensordata_out, post_step_forward_sensor, control_is_constant,
+                   scratch_models ? (*scratch_models)[id] : nullptr,
+                   per_env_fields,
+                   cached_env_ids ? &(*cached_env_ids)[id] : nullptr,
+                   warning_out);
     };
     pool->Schedule(task);
   }
@@ -748,7 +1055,13 @@ void _unsafe_subset_reset_range(
     const std::vector<raw::MjModel*>& models, raw::MjData* d, const int* env_ids,
     int start, int end, const mjtNum* initial_state,
     const mjtNum* initial_warmstart, const uint8_t* needs_refresh_per_k,
-    mjtNum* state_out, mjtNum* sensordata_out, int skipsensor) {
+    mjtNum* state_out, mjtNum* sensordata_out, int skipsensor,
+    // Per-env patching (nullable)
+    raw::MjModel* scratch_model,
+    const PerEnvFieldsMap* per_env_fields,
+    int* cached_env_id,
+    // First raised warning index per env_ids row k, nullable. (n,)
+    int32_t* warning_out) {
   const raw::MjModel* m0 = models[0];
   size_t nstate = static_cast<size_t>(mj_stateSize(m0, mjSTATE_FULLPHYSICS));
   size_t nv = static_cast<size_t>(m0->nv);
@@ -758,11 +1071,24 @@ void _unsafe_subset_reset_range(
 
   for (int k = start; k < end; ++k) {
     int e = env_ids[k];
-    raw::MjModel* me = models[e];
+
+    // Resolve model for env e
+    raw::MjModel* me;
+    if (per_env_fields && scratch_model && cached_env_id) {
+      if (*cached_env_id != e) {
+        ApplyEnvFieldsToModel(e, *per_env_fields, scratch_model, d);
+        *cached_env_id = e;
+      }
+      auto it2 = per_env_fields->find(e);
+      me = (it2 != per_env_fields->end()) ? scratch_model : models[0];
+    } else {
+      me = models[e];
+    }
 
     // Selective refresh of model-level derived constants (body_subtreemass,
     // dof_M0, ...). Uses d as scratch, so must run before we set up d.
-    if (needs_refresh_per_k && needs_refresh_per_k[k]) {
+    // When using per-env fields, ApplyEnvFieldsToModel already called mj_setConst.
+    if (!per_env_fields && needs_refresh_per_k && needs_refresh_per_k[k]) {
       mj_setConst(me, d);
     }
 
@@ -797,6 +1123,14 @@ void _unsafe_subset_reset_range(
 
     mj_forwardSkip(me, d, mjSTAGE_NONE, skipsensor);
 
+    // mj_forwardSkip does not run mj_checkPos / mj_checkVel / mj_checkAcc, so
+    // unlike the step kernel this path cannot autoreset — a bad caller-supplied
+    // qvel passes straight through. What it can raise is INERTIA / CONTACTFULL /
+    // CNSTRFULL from the solver, which were previously invisible too.
+    if (warning_out) {
+      warning_out[k] = FirstRaisedWarning(d);
+    }
+
     if (state_out) {
       mj_getState(me, d, state_out + static_cast<size_t>(k) * nstate,
                   mjSTATE_FULLPHYSICS);
@@ -813,7 +1147,12 @@ void _unsafe_subset_reset_threaded(
     const int* env_ids, int n, const mjtNum* initial_state,
     const mjtNum* initial_warmstart, const uint8_t* needs_refresh_per_k,
     mjtNum* state_out, mjtNum* sensordata_out, int skipsensor, ThreadPool* pool,
-    int chunk_size) {
+    int chunk_size,
+    // Per-env patching (nullable)
+    std::vector<raw::MjModel*>* scratch_models,
+    const PerEnvFieldsMap* per_env_fields,
+    std::vector<int>* cached_env_ids,
+    int32_t* warning_out) {
   int nfulljobs = n / chunk_size;
   int chunk_remainder = n % chunk_size;
   int njobs = (chunk_remainder > 0) ? nfulljobs + 1 : nfulljobs;
@@ -826,17 +1165,26 @@ void _unsafe_subset_reset_threaded(
       _unsafe_subset_reset_range(models, d[id], env_ids, j * chunk_size,
                                  (j + 1) * chunk_size, initial_state,
                                  initial_warmstart, needs_refresh_per_k,
-                                 state_out, sensordata_out, skipsensor);
+                                 state_out, sensordata_out, skipsensor,
+                                 scratch_models ? (*scratch_models)[id] : nullptr,
+                                 per_env_fields,
+                                 cached_env_ids ? &(*cached_env_ids)[id] : nullptr,
+                                 warning_out);
     };
     pool->Schedule(task);
   }
   if (chunk_remainder > 0) {
     auto task = [=, &models, &d](void) {
+      int id = pool->WorkerId();
       _unsafe_subset_reset_range(
-          models, d[pool->WorkerId()], env_ids, nfulljobs * chunk_size,
+          models, d[id], env_ids, nfulljobs * chunk_size,
           nfulljobs * chunk_size + chunk_remainder, initial_state,
           initial_warmstart, needs_refresh_per_k, state_out, sensordata_out,
-          skipsensor);
+          skipsensor,
+          scratch_models ? (*scratch_models)[id] : nullptr,
+          per_env_fields,
+          cached_env_ids ? &(*cached_env_ids)[id] : nullptr,
+          warning_out);
     };
     pool->Schedule(task);
   }
@@ -853,7 +1201,12 @@ void _unsafe_subset_reset_threaded(
 void _unsafe_full_forward_range(const std::vector<raw::MjModel*>& models,
                                 raw::MjData* d, int start, int end,
                                 const mjtNum* state0, const mjtNum* warmstart0,
-                                mjtNum* sensordata_out, int skipsensor) {
+                                mjtNum* sensordata_out, int skipsensor,
+                                // Per-env patching (nullable)
+                                raw::MjModel* scratch_model,
+                                const PerEnvFieldsMap* per_env_fields,
+                                int* cached_env_id,
+                                int32_t* warning_out) {
   const raw::MjModel* m0 = models[0];
   size_t nstate = static_cast<size_t>(mj_stateSize(m0, mjSTATE_FULLPHYSICS));
   size_t nv = static_cast<size_t>(m0->nv);
@@ -862,7 +1215,18 @@ void _unsafe_full_forward_range(const std::vector<raw::MjModel*>& models,
   size_t nsensordata = static_cast<size_t>(m0->nsensordata);
 
   for (int r = start; r < end; ++r) {
-    raw::MjModel* me = models[r];
+    // Resolve model for env r
+    raw::MjModel* me;
+    if (per_env_fields && scratch_model && cached_env_id) {
+      if (*cached_env_id != r) {
+        ApplyEnvFieldsToModel(r, *per_env_fields, scratch_model, d);
+        *cached_env_id = r;
+      }
+      auto it2 = per_env_fields->find(r);
+      me = (it2 != per_env_fields->end()) ? scratch_model : models[0];
+    } else {
+      me = models[r];
+    }
 
     mju_zero(d->ctrl, me->nu);
     mju_zero(d->qfrc_applied, nv);
@@ -893,6 +1257,10 @@ void _unsafe_full_forward_range(const std::vector<raw::MjModel*>& models,
 
     mj_forwardSkip(me, d, mjSTAGE_NONE, skipsensor);
 
+    if (warning_out) {
+      warning_out[r] = FirstRaisedWarning(d);
+    }
+
     if (!skipsensor) {
       mju_copy(sensordata_out + static_cast<size_t>(r) * nsensordata,
                d->sensordata, nsensordata);
@@ -905,7 +1273,12 @@ void _unsafe_full_forward_threaded(const std::vector<raw::MjModel*>& models,
                                    const mjtNum* state0,
                                    const mjtNum* warmstart0,
                                    mjtNum* sensordata_out, int skipsensor,
-                                   ThreadPool* pool, int chunk_size) {
+                                   ThreadPool* pool, int chunk_size,
+                                   // Per-env patching (nullable)
+                                   std::vector<raw::MjModel*>* scratch_models,
+                                   const PerEnvFieldsMap* per_env_fields,
+                                   std::vector<int>* cached_env_ids,
+                                   int32_t* warning_out) {
   int nfulljobs = nbatch / chunk_size;
   int chunk_remainder = nbatch % chunk_size;
   int njobs = (chunk_remainder > 0) ? nfulljobs + 1 : nfulljobs;
@@ -917,16 +1290,25 @@ void _unsafe_full_forward_threaded(const std::vector<raw::MjModel*>& models,
       int id = pool->WorkerId();
       _unsafe_full_forward_range(models, d[id], j * chunk_size,
                                  (j + 1) * chunk_size, state0, warmstart0,
-                                 sensordata_out, skipsensor);
+                                 sensordata_out, skipsensor,
+                                 scratch_models ? (*scratch_models)[id] : nullptr,
+                                 per_env_fields,
+                                 cached_env_ids ? &(*cached_env_ids)[id] : nullptr,
+                                 warning_out);
     };
     pool->Schedule(task);
   }
   if (chunk_remainder > 0) {
     auto task = [=, &models, &d](void) {
+      int id = pool->WorkerId();
       _unsafe_full_forward_range(
-          models, d[pool->WorkerId()], nfulljobs * chunk_size,
+          models, d[id], nfulljobs * chunk_size,
           nfulljobs * chunk_size + chunk_remainder, state0, warmstart0,
-          sensordata_out, skipsensor);
+          sensordata_out, skipsensor,
+          scratch_models ? (*scratch_models)[id] : nullptr,
+          per_env_fields,
+          cached_env_ids ? &(*cached_env_ids)[id] : nullptr,
+          warning_out);
     };
     pool->Schedule(task);
   }
@@ -1289,11 +1671,36 @@ class BatchEnvPool {
     nstate_ = mj_stateSize(models_[0], mjSTATE_FULLPHYSICS);
     nv_ = models_[0]->nv;
     nsensordata_ = models_[0]->nsensordata;
+
+    // Scratch models for per-thread field patching (in addition to worker_data_).
+    int nmodels = nthread_ > 0 ? nthread_ : 1;
+    scratch_models_.resize(nmodels, nullptr);
+    thread_current_env_.resize(nmodels, -1);
+    for (int t = 0; t < nmodels; ++t) {
+      scratch_models_[t] = InterceptMjErrors(mj_copyModel)(nullptr, largest_model);
+      if (scratch_models_[t] == nullptr) {
+        // cleanup on failure
+        for (int j = 0; j < t; ++j) {
+          if (scratch_models_[j]) mj_deleteModel(scratch_models_[j]);
+        }
+        for (raw::MjData* d : worker_data_) {
+          if (d) mj_deleteData(d);
+        }
+        for (raw::MjModel* m : owned_models_) {
+          if (m) mj_deleteModel(m);
+        }
+        throw py::value_error("mj_copyModel scratch_models_ failed");
+      }
+    }
   }
 
   ~BatchEnvPool() {
     // shared_ptr release joins the thread pool before we tear down data.
     pool_.reset();
+    for (raw::MjModel* m : scratch_models_) {
+      if (m) mj_deleteModel(m);
+    }
+    scratch_models_.clear();
     for (raw::MjData* d : worker_data_) {
       if (d) mj_deleteData(d);
     }
@@ -1316,21 +1723,12 @@ class BatchEnvPool {
   }
 
   raw::MjModel* EnsureUniqueModel(int env_id) {
-    raw::MjModel* current = models_[env_id];
-    auto it = model_refcounts_.find(current);
-    if (it == model_refcounts_.end() || it->second <= 1) {
-      return current;
-    }
+    // OLD approach: mj_copyModel the entire 28 MB model per env -> 116 GB for 4096 envs.
+    // NEW approach: side-table stores only per-env deltas (~6 KB), patched into per-thread scratch models.
+    // This function is now a no-op stub; writes go into per_env_fields_ instead.
 
-    raw::MjModel* fresh = InterceptMjErrors(mj_copyModel)(nullptr, current);
-    if (fresh == nullptr) {
-      throw py::value_error("mj_copyModel failed while uniquifying model");
-    }
-    --it->second;
-    owned_models_.push_back(fresh);
-    model_refcounts_[fresh] = 1;
-    models_[env_id] = fresh;
-    return fresh;
+    // Return the shared base model pointer (not used by new write path, kept for get_model compat).
+    return models_[env_id];
   }
 
   // -----------------------------------------------------------------
@@ -1403,6 +1801,9 @@ class BatchEnvPool {
     std::vector<const raw::MjModel*> cmodels(nbatch_);
     for (int i = 0; i < nbatch_; ++i) cmodels[i] = models_[i];
 
+    last_step_warning_.assign(static_cast<size_t>(nbatch_), kNoWarning);
+    int32_t* warning_ptr = last_step_warning_.data();
+
     {
       py::gil_scoped_release no_gil;
       if (nthread_ > 0 && nbatch_ > 1) {
@@ -1413,12 +1814,20 @@ class BatchEnvPool {
             cmodels, worker_data_, nbatch_, nstep, control_spec, state0_ptr,
             warmstart0_ptr, control_ptr, state_ptr, sensordata_ptr,
             post_step_forward_sensor, pool_.get(), chunk,
-            control_is_constant);
+            control_is_constant,
+            per_env_fields_.empty() ? nullptr : &scratch_models_,
+            per_env_fields_.empty() ? nullptr : &per_env_fields_,
+            per_env_fields_.empty() ? nullptr : &thread_current_env_,
+            warning_ptr);
       } else {
         InterceptMjErrors(_unsafe_step)(
             cmodels, worker_data_[0], 0, nbatch_, nstep, control_spec,
             state0_ptr, warmstart0_ptr, control_ptr, state_ptr,
-            sensordata_ptr, post_step_forward_sensor, control_is_constant);
+            sensordata_ptr, post_step_forward_sensor, control_is_constant,
+            per_env_fields_.empty() ? nullptr : scratch_models_[0],
+            per_env_fields_.empty() ? nullptr : &per_env_fields_,
+            per_env_fields_.empty() ? nullptr : &thread_current_env_[0],
+            warning_ptr);
       }
     }
 
@@ -1455,6 +1864,9 @@ class BatchEnvPool {
     mjtNum* sensordata_ptr =
         static_cast<mjtNum*>(sensordata_out.request().ptr);
 
+    last_forward_warning_.assign(static_cast<size_t>(nbatch_), kNoWarning);
+    int32_t* warning_ptr = last_forward_warning_.data();
+
     {
       py::gil_scoped_release no_gil;
       if (nthread_ > 0 && nbatch_ > 1) {
@@ -1463,11 +1875,19 @@ class BatchEnvPool {
                         : std::max(1, nbatch_ / (10 * nthread_));
         InterceptMjErrors(_unsafe_full_forward_threaded)(
             models_, worker_data_, nbatch_, state0_ptr, warmstart0_ptr,
-            sensordata_ptr, skipsensor ? 1 : 0, pool_.get(), chunk);
+            sensordata_ptr, skipsensor ? 1 : 0, pool_.get(), chunk,
+            per_env_fields_.empty() ? nullptr : &scratch_models_,
+            per_env_fields_.empty() ? nullptr : &per_env_fields_,
+            per_env_fields_.empty() ? nullptr : &thread_current_env_,
+            warning_ptr);
       } else {
         InterceptMjErrors(_unsafe_full_forward_range)(
             models_, worker_data_[0], 0, nbatch_, state0_ptr, warmstart0_ptr,
-            sensordata_ptr, skipsensor ? 1 : 0);
+            sensordata_ptr, skipsensor ? 1 : 0,
+            per_env_fields_.empty() ? nullptr : scratch_models_[0],
+            per_env_fields_.empty() ? nullptr : &per_env_fields_,
+            per_env_fields_.empty() ? nullptr : &thread_current_env_[0],
+            warning_ptr);
       }
     }
 
@@ -1680,6 +2100,9 @@ class BatchEnvPool {
     PyCArray state_out({n, nstate_});
     PyCArray sensordata_out({n, nsensordata_});
 
+    // Env-indexed, so envs left untouched by this reset stay kNoWarning.
+    last_reset_warning_.assign(static_cast<size_t>(nbatch_), kNoWarning);
+
     if (n == 0) {
       return py::make_tuple(state_out, sensordata_out);
     }
@@ -1735,16 +2158,52 @@ class BatchEnvPool {
         }
         const mjtNum* src = static_cast<const mjtNum*>(info.ptr);
 
-        // Apply per-env in C++ while the GIL is held.
+        // Apply per-env into side-table while the GIL is held.
         for (int k = 0; k < n; ++k) {
           int e = env_ids_ptr[k];
-          raw::MjModel* model = EnsureUniqueModel(e);
-          WriteField(spec->id, model, src + static_cast<size_t>(k) * field_size);
+          // Ensure side-table entry exists
+          if (per_env_fields_.find(e) == per_env_fields_.end()) {
+            per_env_fields_[e] = PerEnvFields();
+            per_env_fields_[e].InitLayout(models_[0]);
+          }
+          PerEnvFields& fields = per_env_fields_[e];
+          fields.needs_patch = true;
+
+          const mjtNum* src_row = src + static_cast<size_t>(k) * field_size;
+          if (spec->id == FieldId::kGeomSize) {
+            std::memcpy(fields.data.data() + fields.geom_size_offset, src_row, fields.geom_size_bytes);
+          } else if (spec->id == FieldId::kGeomPos) {
+            std::memcpy(fields.data.data() + fields.geom_pos_offset, src_row, fields.geom_pos_bytes);
+          } else if (spec->id == FieldId::kBodyMass) {
+            std::memcpy(fields.data.data() + fields.body_mass_offset, src_row, fields.body_mass_bytes);
+          } else if (spec->id == FieldId::kBodyIpos) {
+            std::memcpy(fields.data.data() + fields.body_ipos_offset, src_row, fields.body_ipos_bytes);
+          } else if (spec->id == FieldId::kBodyIquat) {
+            std::memcpy(fields.data.data() + fields.body_iquat_offset, src_row, fields.body_iquat_bytes);
+          } else if (spec->id == FieldId::kBodyInertia) {
+            std::memcpy(fields.data.data() + fields.body_inertia_offset, src_row, fields.body_inertia_bytes);
+          } else if (spec->id == FieldId::kGeomFriction) {
+            std::memcpy(fields.data.data() + fields.geom_friction_offset, src_row, fields.geom_friction_bytes);
+          } else if (spec->id == FieldId::kDofArmature) {
+            std::memcpy(fields.data.data() + fields.dof_armature_offset, src_row, fields.dof_armature_bytes);
+          } else if (spec->id == FieldId::kGravity) {
+            std::memcpy(fields.data.data() + fields.gravity_offset, src_row, fields.gravity_bytes);
+          } else if (spec->id == FieldId::kKp) {
+            std::memcpy(fields.data.data() + fields.kp_offset, src_row, fields.kp_bytes);
+          } else if (spec->id == FieldId::kKd) {
+            std::memcpy(fields.data.data() + fields.kd_offset, src_row, fields.kd_bytes);
+          }
         }
+        // geom_bounds refresh done lazily in ApplyEnvFieldsToModel
         if (spec->needs_refresh) {
           for (int k = 0; k < n; ++k) needs_refresh[k] = 1;
         }
       }
+    }
+
+    // Invalidate thread caches whenever side-table was written
+    if (randomization.has_value() && !randomization->empty()) {
+      for (int& ce : thread_current_env_) ce = -1;
     }
 
     const uint8_t* refresh_ptr =
@@ -1754,6 +2213,10 @@ class BatchEnvPool {
     mjtNum* sensordata_ptr =
         static_cast<mjtNum*>(sensordata_out.request().ptr);
 
+    // The kernel indexes outputs by row k, so collect per-k then scatter.
+    std::vector<int32_t> warning_per_k(static_cast<size_t>(n), kNoWarning);
+    int32_t* warning_ptr = warning_per_k.data();
+
     {
       py::gil_scoped_release no_gil;
       if (nthread_ > 0 && n > 1) {
@@ -1762,14 +2225,26 @@ class BatchEnvPool {
                         : std::max(1, n / (10 * nthread_));
         InterceptMjErrors(_unsafe_subset_reset_threaded)(
             models_, worker_data_, env_ids_ptr, n, initial_state_ptr,
-            initial_warmstart_ptr, refresh_ptr, state_ptr, sensordata_ptr,
-            skipsensor ? 1 : 0, pool_.get(), chunk);
+            initial_warmstart_ptr, nullptr, state_ptr, sensordata_ptr,
+            skipsensor ? 1 : 0, pool_.get(), chunk,
+            per_env_fields_.empty() ? nullptr : &scratch_models_,
+            per_env_fields_.empty() ? nullptr : &per_env_fields_,
+            per_env_fields_.empty() ? nullptr : &thread_current_env_,
+            warning_ptr);
       } else {
         InterceptMjErrors(_unsafe_subset_reset_range)(
             models_, worker_data_[0], env_ids_ptr, 0, n, initial_state_ptr,
-            initial_warmstart_ptr, refresh_ptr, state_ptr, sensordata_ptr,
-            skipsensor ? 1 : 0);
+            initial_warmstart_ptr, nullptr, state_ptr, sensordata_ptr,
+            skipsensor ? 1 : 0,
+            per_env_fields_.empty() ? nullptr : scratch_models_[0],
+            per_env_fields_.empty() ? nullptr : &per_env_fields_,
+            per_env_fields_.empty() ? nullptr : &thread_current_env_[0],
+            warning_ptr);
       }
+    }
+
+    for (int k = 0; k < n; ++k) {
+      last_reset_warning_[static_cast<size_t>(env_ids_ptr[k])] = warning_per_k[k];
     }
 
     return py::make_tuple(state_out, sensordata_out);
@@ -1796,9 +2271,49 @@ class BatchEnvPool {
     return {};
   }
 
+  // -----------------------------------------------------------------
+  // Warning observability.
+  //
+  // Additive read-only surface: step / forward / reset keep their existing
+  // return shapes, and each records the first raised mjtWarning per env into
+  // its own buffer. -1 means "no warning". Valid until the next call of the
+  // same primitive; a pool that has never run one returns all -1.
+  // -----------------------------------------------------------------
+  py::array_t<int32_t> last_step_warning() const {
+    return WarningArray(last_step_warning_);
+  }
+  py::array_t<int32_t> last_forward_warning() const {
+    return WarningArray(last_forward_warning_);
+  }
+  py::array_t<int32_t> last_reset_warning() const {
+    return WarningArray(last_reset_warning_);
+  }
+  static int num_warning_kinds() { return mjNWARNING; }
+
+  void _PatchFieldsIntoModel(int env_id, raw::MjModel* model) {
+    // Delegate to the namespace-level function; use worker_data_[0] for mj_setConst scratch.
+    ApplyEnvFieldsToModel(env_id, per_env_fields_, model, worker_data_[0]);
+  }
+
   py::object get_model(int env_id) {
     ValidateEnvIdOrThrow(env_id, nbatch_);
-    raw::MjModel* model = EnsureUniqueModel(env_id);
+
+    // If this env has per-env fields, patch them into a temp model
+    if (per_env_fields_.find(env_id) != per_env_fields_.end()) {
+      raw::MjModel* temp = InterceptMjErrors(mj_copyModel)(nullptr, models_[0]);
+      if (!temp) {
+        throw py::value_error("mj_copyModel failed in get_model");
+      }
+      _PatchFieldsIntoModel(env_id, temp);
+      // Wrap and return (Python wrapper owns the temp model)
+      py::object wrapper = MjModelFromPointer(temp);
+      py_model_wrappers_[temp] = wrapper;
+      py_owned_models_.insert(temp);
+      return wrapper;
+    }
+
+    // No per-env fields: return shared base model
+    raw::MjModel* model = models_[env_id];
     auto it = py_model_wrappers_.find(model);
     if (it != py_model_wrappers_.end()) {
       return it->second;
@@ -1840,10 +2355,22 @@ class BatchEnvPool {
     ValidateEnvIdOrThrow(env_id, nbatch_);
     const FieldSpec& spec = LookupFieldOrThrow(name);
     int sz = FieldSize(spec.id, models_[env_id]);
-    // Copy into a fresh array to avoid lifetime entanglement with the pool.
+
+    // If env has per-env fields, read from side-table
+    auto it = per_env_fields_.find(env_id);
+    if (it != per_env_fields_.end()) {
+      auto [ptr, nbytes] = it->second.FieldSlot(spec.id);
+      if (ptr && nbytes > 0) {
+        py::array_t<mjtNum> out(static_cast<py::ssize_t>(sz));
+        // For kp/kd the slot stores raw logical values, same as CopyFieldOut
+        std::memcpy(out.request().ptr, ptr, nbytes);
+        return out;
+      }
+    }
+
+    // Fall back to base model
     py::array_t<mjtNum> out(static_cast<py::ssize_t>(sz));
-    CopyFieldOut(
-        spec.id, models_[env_id], static_cast<mjtNum*>(out.request().ptr));
+    CopyFieldOut(spec.id, models_[env_id], static_cast<mjtNum*>(out.request().ptr));
     return out;
   }
 
@@ -1865,6 +2392,26 @@ class BatchEnvPool {
     py::array_t<mjtNum> out(shape);
     mjtNum* dst = static_cast<mjtNum*>(out.request().ptr);
     const int* index_ptr = static_cast<const int*>(index_info.ptr);
+
+    // If env has per-env fields, read from side-table
+    auto it = per_env_fields_.find(env_id);
+    if (it != per_env_fields_.end()) {
+      auto [ptr, nbytes] = it->second.FieldSlot(spec.id);
+      if (ptr && nbytes > 0) {
+        const mjtNum* src = reinterpret_cast<const mjtNum*>(ptr);
+        for (int i = 0; i < n; ++i) {
+          int idx = index_ptr[i];
+          ValidateFieldIndexOrThrow(idx, index_count, name);
+          mjtNum* dest_ptr = dst + static_cast<size_t>(i) * width;
+          for (int w = 0; w < width; ++w) {
+            dest_ptr[w] = src[static_cast<size_t>(idx) * width + w];
+          }
+        }
+        return out;
+      }
+    }
+
+    // Fall back to base model
     for (int i = 0; i < n; ++i) {
       ValidateFieldIndexOrThrow(index_ptr[i], index_count, name);
       CopyIndexedFieldOut(spec.id, models_[env_id], index_ptr[i],
@@ -1892,21 +2439,55 @@ class BatchEnvPool {
       throw py::value_error(msg.str());
     }
 
-    raw::MjModel* model = EnsureUniqueModel(env_id);
+    // OLD: raw::MjModel* model = EnsureUniqueModel(env_id);
+    // NEW: write into side-table, mark needs_patch
+    if (per_env_fields_.find(env_id) == per_env_fields_.end()) {
+      per_env_fields_[env_id] = PerEnvFields();
+      per_env_fields_[env_id].InitLayout(models_[0]);  // use base model
+    }
+    auto& fields = per_env_fields_[env_id];
+    fields.needs_patch = true;
+
+    raw::MjModel* model = models_[env_id];
     int index_count = FieldIndexCount(spec.id, model);
     const int* index_ptr = static_cast<const int*>(index_info.ptr);
     const mjtNum* src = static_cast<const mjtNum*>(value_info.ptr);
+
+    // Write to side-table using FieldSlot for uniform dispatch
     for (int i = 0; i < n; ++i) {
-      ValidateFieldIndexOrThrow(index_ptr[i], index_count, name);
-      WriteIndexedField(spec.id, model, index_ptr[i],
-                        src + static_cast<size_t>(i) * width);
+      int idx = index_ptr[i];
+      ValidateFieldIndexOrThrow(idx, index_count, name);
+      const mjtNum* value_ptr = src + static_cast<size_t>(i) * width;
+
+      auto [slot_ptr, slot_bytes] = fields.FieldSlot(spec.id);
+      if (slot_ptr && slot_bytes > 0) {
+        mjtNum* dest = reinterpret_cast<mjtNum*>(slot_ptr) + static_cast<size_t>(idx) * width;
+        for (int w = 0; w < width; ++w) dest[w] = value_ptr[w];
+      } else {
+        // Field not in side-table layout — should not happen with InitLayout covering all 11 fields
+        WriteIndexedField(spec.id, model, idx, value_ptr);
+      }
     }
-    if (spec.needs_refresh && n > 0) {
-      InterceptMjErrors(mj_setConst)(model, worker_data_[0]);
-    }
+
+    // Invalidate thread caches so next step re-patches the scratch model
+    for (int& ce : thread_current_env_) ce = -1;
   }
 
  private:
+  // Copy out rather than alias the vector: the buffers are reassigned on every
+  // step, so a zero-copy view would dangle or silently change under the caller.
+  py::array_t<int32_t> WarningArray(const std::vector<int32_t>& src) const {
+    py::array_t<int32_t> out(static_cast<py::ssize_t>(nbatch_));
+    int32_t* dst = static_cast<int32_t*>(out.request().ptr);
+    if (src.size() == static_cast<size_t>(nbatch_)) {
+      std::memcpy(dst, src.data(), src.size() * sizeof(int32_t));
+    } else {
+      // No call of this primitive yet.
+      for (int i = 0; i < nbatch_; ++i) dst[i] = kNoWarning;
+    }
+    return out;
+  }
+
   int nbatch_;
   int nthread_;
   int nstate_ = 0;
@@ -1920,6 +2501,22 @@ class BatchEnvPool {
   std::shared_ptr<ThreadPool> pool_;
   std::unordered_map<raw::MjModel*, py::object> py_model_wrappers_;
   std::unordered_set<raw::MjModel*> py_owned_models_;
+
+  // Per-env field deltas (side-table). Only populated for envs that have had
+  // set_field_indexed or reset(randomization=...) writes.
+  PerEnvFieldsMap per_env_fields_;
+
+  // Per-thread scratch models for patching per-env fields before step.
+  std::vector<raw::MjModel*> scratch_models_;
+
+  // Which env is currently patched into scratch_models_[thread_id]? -1 = none.
+  std::vector<int> thread_current_env_;
+
+  // First raised mjtWarning per env for the most recent call of each
+  // primitive; -1 = none. Empty until that primitive has run once.
+  std::vector<int32_t> last_step_warning_;
+  std::vector<int32_t> last_forward_warning_;
+  std::vector<int32_t> last_reset_warning_;
 };
 
 PYBIND11_MODULE(_batch_env, pymodule) {
@@ -1972,7 +2569,37 @@ PYBIND11_MODULE(_batch_env, pymodule) {
       .def_property_readonly("nv", &BatchEnvPool::nv)
       .def_property_readonly("nsensordata", &BatchEnvPool::nsensordata)
       .def_property_readonly("cpu_ids", &BatchEnvPool::cpu_ids)
-      .def("worker_cpu_ids", &BatchEnvPool::worker_cpu_ids);
+      .def("worker_cpu_ids", &BatchEnvPool::worker_cpu_ids)
+      .def_property_readonly("last_step_warning",
+                             &BatchEnvPool::last_step_warning)
+      .def_property_readonly("last_forward_warning",
+                             &BatchEnvPool::last_forward_warning)
+      .def_property_readonly("last_reset_warning",
+                             &BatchEnvPool::last_reset_warning);
+
+  pymodule.attr("NO_WARNING") = py::int_(kNoWarning);
+  pymodule.attr("NUM_WARNING_KINDS") = py::int_(static_cast<int>(mjNWARNING));
+  pymodule.attr("WARNING_NAMES") = []() {
+    // Order matches mjtWarning in mjmodel.h. mj_checkPos / mj_checkVel /
+    // mj_checkAcc are the three that call mj_resetData. The static_assert makes
+    // a future MuJoCo that grows mjtWarning a build error rather than a silent
+    // name/index mismatch.
+    constexpr const char* kNames[] = {"INERTIA", "CONTACTFULL", "CNSTRFULL",
+                                      "BADQPOS", "BADQVEL",     "BADQACC",
+                                      "BADCTRL"};
+    static_assert(sizeof(kNames) / sizeof(kNames[0]) == mjNWARNING,
+                  "WARNING_NAMES must cover every mjtWarning");
+    py::list out;
+    for (const char* name : kNames) out.append(py::str(name));
+    return out;
+  }();
+  pymodule.attr("AUTORESET_WARNINGS") = []() {
+    py::list out;
+    out.append(py::int_(static_cast<int>(mjWARN_BADQPOS)));
+    out.append(py::int_(static_cast<int>(mjWARN_BADQVEL)));
+    out.append(py::int_(static_cast<int>(mjWARN_BADQACC)));
+    return out;
+  }();
 
   pymodule.attr("SUPPORTED_FIELDS") = []() {
     py::list out;

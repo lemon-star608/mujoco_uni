@@ -31,18 +31,33 @@ def batch_diagnostics() -> dict[str, object]:
     }
 
 
+_LAZY_FROM_BATCH = frozenset(
+    {
+        "BatchEnvPool",
+        "SUPPORTED_FIELDS",
+        "AUTORESET_WARNINGS",
+        "NO_WARNING",
+        "WARNING_NAMES",
+        "warning_is_autoreset",
+    }
+)
+
 __all__ = [
+    "AUTORESET_WARNINGS",
     "BatchEnvPool",
+    "NO_WARNING",
     "SUPPORTED_FIELDS",
+    "WARNING_NAMES",
     "available_backends",
     "batch_available",
     "batch_diagnostics",
     "batch_import_error",
+    "warning_is_autoreset",
 ]
 
 
 def __getattr__(name: str):
-    if name in {"BatchEnvPool", "SUPPORTED_FIELDS"}:
+    if name in _LAZY_FROM_BATCH:
         from . import batch
 
         return getattr(batch, name)

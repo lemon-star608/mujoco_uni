@@ -75,16 +75,16 @@ class BuildExt(build_ext):
                 ext.extra_objects.append(
                     str(_make_windows_import_lib(dll, ext.sources, Path(self.build_temp)))
                 )
-                ext.extra_compile_args.extend(["/std:c++17"])
+                ext.extra_compile_args.extend(["/std:c++17", "/W4"])
             else:
                 ext.extra_objects.append(str(libmujoco))
             if system == "Darwin":
-                ext.extra_compile_args.extend(["-std=c++17", "-stdlib=libc++"])
+                ext.extra_compile_args.extend(["-std=c++17", "-stdlib=libc++", "-Wall"])
                 ext.extra_link_args.extend(
                     ["-stdlib=libc++", "-Wl,-rpath,@loader_path/../../mujoco"]
                 )
             elif system == "Linux":
-                ext.extra_compile_args.extend(["-std=c++17"])
+                ext.extra_compile_args.extend(["-std=c++17", "-Wall"])
                 ext.extra_link_args.extend(["-Wl,-rpath,$ORIGIN/../../mujoco"])
         super().build_extensions()
 
