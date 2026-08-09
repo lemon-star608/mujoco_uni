@@ -421,7 +421,7 @@ const raw::MjModel* CastMjModelOrThrow(
   }
 }
 
-bool SameModelDataLayout(const raw::MjModel* lhs, const raw::MjModel* rhs) {
+bool SameModelStateLayout(const raw::MjModel* lhs, const raw::MjModel* rhs) {
   if (mj_stateSize(lhs, mjSTATE_FULLPHYSICS) !=
       mj_stateSize(rhs, mjSTATE_FULLPHYSICS)) {
     return false;
@@ -438,7 +438,7 @@ bool SameModelDataLayout(const raw::MjModel* lhs, const raw::MjModel* rhs) {
   MJ_MODEL_FIELD_EQ(nbvhdynamic);
   MJ_MODEL_FIELD_EQ(njnt);
   MJ_MODEL_FIELD_EQ(nM);
-  MJ_MODEL_FIELD_EQ(nC);
+  // nC may vary with body_simple; the allocation envelope handles it below.
   MJ_MODEL_FIELD_EQ(nD);
   // MJ_MODEL_FIELD_EQ(ngeom);  // relaxed: one object has fewer geoms
   MJ_MODEL_FIELD_EQ(nsite);
@@ -466,6 +466,56 @@ bool SameModelDataLayout(const raw::MjModel* lhs, const raw::MjModel* rhs) {
   // MJ_MODEL_FIELD_EQ(narena);  // relaxed: use largest_model for MjData alloc
   // MJ_MODEL_FIELD_EQ(nbuffer);  // relaxed: varies with mesh vertex count
 #undef MJ_MODEL_FIELD_EQ
+
+  return true;
+}
+
+// mjData's main buffer is partitioned into independently addressed arrays whose
+// lengths come from mjModel.  Reusing data allocated for a different model is
+// safe only when the allocation model is at least as large in every one of
+// those dimensions.  Aggregate nbuffer alone is insufficient: a deficit in
+// one array can overwrite the following array even if another array is larger.
+bool ModelDataEnvelopeDominates(const raw::MjModel* candidate,
+                                const raw::MjModel* model) {
+#define MJ_MODEL_FIELD_GE(name) \
+  if (candidate->name < model->name) return false
+  MJ_MODEL_FIELD_GE(nq);
+  MJ_MODEL_FIELD_GE(nv);
+  MJ_MODEL_FIELD_GE(na);
+  MJ_MODEL_FIELD_GE(nhistory);
+  MJ_MODEL_FIELD_GE(npluginstate);
+  MJ_MODEL_FIELD_GE(nu);
+  MJ_MODEL_FIELD_GE(nbody);
+  MJ_MODEL_FIELD_GE(neq);
+  MJ_MODEL_FIELD_GE(nmocap);
+  MJ_MODEL_FIELD_GE(nuserdata);
+  MJ_MODEL_FIELD_GE(nsensordata);
+  MJ_MODEL_FIELD_GE(ntree);
+  MJ_MODEL_FIELD_GE(nplugin);
+  MJ_MODEL_FIELD_GE(njnt);
+  MJ_MODEL_FIELD_GE(ngeom);
+  MJ_MODEL_FIELD_GE(nsite);
+  MJ_MODEL_FIELD_GE(ncam);
+  MJ_MODEL_FIELD_GE(nlight);
+  MJ_MODEL_FIELD_GE(nflexvert);
+  MJ_MODEL_FIELD_GE(nflexedge);
+  MJ_MODEL_FIELD_GE(nflexelem);
+  MJ_MODEL_FIELD_GE(nJfe);
+  MJ_MODEL_FIELD_GE(nJfv);
+  MJ_MODEL_FIELD_GE(nbvhdynamic);
+  MJ_MODEL_FIELD_GE(ntendon);
+#if MUJOCO_UNI_HAS_TENDON_SPARSITY_COUNT
+  MJ_MODEL_FIELD_GE(nJten);
+#endif
+  MJ_MODEL_FIELD_GE(nwrap);
+  MJ_MODEL_FIELD_GE(nJmom);
+  MJ_MODEL_FIELD_GE(nM);
+  MJ_MODEL_FIELD_GE(nC);
+  MJ_MODEL_FIELD_GE(nbvh);
+  MJ_MODEL_FIELD_GE(nD);
+  MJ_MODEL_FIELD_GE(narena);
+  MJ_MODEL_FIELD_GE(nbuffer);
+#undef MJ_MODEL_FIELD_GE
 
   return true;
 }
@@ -502,7 +552,7 @@ std::vector<const raw::MjModel*> NormalizeModelsOrThrow(py::object model_obj,
   }
 
   for (py::ssize_t i = 1; i < nmodel; ++i) {
-    if (!SameModelDataLayout(models[0], models[i])) {
+    if (!SameModelStateLayout(models[0], models[i])) {
       std::ostringstream msg;
       msg << "models are not compatible: model[0] and model[" << i << "]";
       throw py::value_error(msg.str());
@@ -513,6 +563,23 @@ std::vector<const raw::MjModel*> NormalizeModelsOrThrow(py::object model_obj,
     models.resize(nbatch, models[0]);
   }
   return models;
+}
+
+const raw::MjModel* SelectDataAllocationModelOrThrow(
+    const std::vector<const raw::MjModel*>& models) {
+  for (const raw::MjModel* candidate : models) {
+    bool dominates_all = true;
+    for (const raw::MjModel* model : models) {
+      if (!ModelDataEnvelopeDominates(candidate, model)) {
+        dominates_all = false;
+        break;
+      }
+    }
+    if (dominates_all) return candidate;
+  }
+  throw py::value_error(
+      "models are compatible in state semantics, but no model provides a "
+      "safe mjData allocation envelope");
 }
 
 std::string SupportedFieldsString() {
@@ -1596,6 +1663,8 @@ class BatchEnvPool {
 
     std::vector<const raw::MjModel*> src_models =
         NormalizeModelsOrThrow(model_obj, nbatch_);
+    const raw::MjModel* allocation_src_model =
+        SelectDataAllocationModelOrThrow(src_models);
 
     // Deduplicate: identical source pointers share one copy.
     // This avoids 3200 mj_copyModel calls when 32 unique models are
@@ -1628,20 +1697,22 @@ class BatchEnvPool {
       ++model_refcounts_[m];
     }
 
-    // Find the model with the largest nbvh to ensure MjData is big enough
-    // for all model variants (different mesh topologies → different nbvh).
-    // mjData.bvh_active has size nbvh, so we need the largest one.
-    const raw::MjModel* largest_model = models_[0];
-    for (int i = 1; i < nbatch_; ++i) {
-      if (models_[i]->nbvh > largest_model->nbvh) {
-        largest_model = models_[i];
+    // Map the selected source envelope to the corresponding owned copy.
+    const raw::MjModel* allocation_model = nullptr;
+    for (int i = 0; i < nbatch_; ++i) {
+      if (src_models[i] == allocation_src_model) {
+        allocation_model = models_[i];
+        break;
       }
+    }
+    if (allocation_model == nullptr) {
+      throw py::value_error("internal error selecting mjData allocation envelope");
     }
 
     int ndata = nthread_ > 0 ? nthread_ : 1;
     worker_data_.resize(ndata, nullptr);
     for (int t = 0; t < ndata; ++t) {
-      worker_data_[t] = mj_makeData(largest_model);
+      worker_data_[t] = mj_makeData(allocation_model);
       if (worker_data_[t] == nullptr) {
         for (int j = 0; j < t; ++j) {
           mj_deleteData(worker_data_[j]);
@@ -1677,7 +1748,7 @@ class BatchEnvPool {
     scratch_models_.resize(nmodels, nullptr);
     thread_current_env_.resize(nmodels, -1);
     for (int t = 0; t < nmodels; ++t) {
-      scratch_models_[t] = InterceptMjErrors(mj_copyModel)(nullptr, largest_model);
+      scratch_models_[t] = InterceptMjErrors(mj_copyModel)(nullptr, allocation_model);
       if (scratch_models_[t] == nullptr) {
         // cleanup on failure
         for (int j = 0; j < t; ++j) {
