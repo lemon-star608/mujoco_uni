@@ -1171,13 +1171,27 @@ mjtNum* required_array_ptr(const PyCArray& arr, const char* name,
 
 class BatchEnvPool {
  public:
-  BatchEnvPool(py::object model_obj, int nbatch, int nthread)
-      : nbatch_(nbatch), nthread_(nthread) {
+  BatchEnvPool(py::object model_obj, int nbatch, int nthread,
+               std::vector<int> cpu_ids)
+      : nbatch_(nbatch), nthread_(nthread), cpu_ids_(std::move(cpu_ids)) {
     if (nbatch_ <= 0) {
       throw py::value_error("nbatch must be positive");
     }
     if (nthread_ < 0) {
       throw py::value_error("nthread must be >= 0");
+    }
+    if (!cpu_ids_.empty()) {
+      if (nthread_ <= 0) {
+        throw py::value_error("cpu_ids requires nthread >= 1");
+      }
+      if (cpu_ids_.size() != static_cast<size_t>(nthread_)) {
+        throw py::value_error("cpu_ids length must equal nthread");
+      }
+      for (int cpu_id : cpu_ids_) {
+        if (cpu_id < 0) {
+          throw py::value_error("cpu_ids entries must be >= 0");
+        }
+      }
     }
 
     std::vector<const raw::MjModel*> src_models =
@@ -1244,7 +1258,13 @@ class BatchEnvPool {
     }
 
     if (nthread_ > 0) {
-      pool_ = std::make_shared<ThreadPool>(nthread_);
+      pool_ = std::make_shared<ThreadPool>(nthread_, cpu_ids_);
+      if (int err = pool_->PinError(); err != 0) {
+        std::ostringstream msg;
+        msg << "failed to pin a worker thread to the requested cpu_ids "
+            << "(error " << err << ")";
+        throw py::value_error(msg.str());
+      }
     }
 
     // Cache sizes.
@@ -1746,6 +1766,18 @@ class BatchEnvPool {
   int nv() const { return nv_; }
   int nsensordata() const { return nsensordata_; }
 
+  // Configured worker→CPU mapping (empty when no affinity was requested).
+  const std::vector<int>& cpu_ids() const { return cpu_ids_; }
+
+  // Per-worker CPU observed at pool startup, after pinning. Empty when no
+  // affinity was requested.
+  std::vector<int> worker_cpu_ids() const {
+    if (pool_ != nullptr && !cpu_ids_.empty()) {
+      return pool_->ObservedCpuIds();
+    }
+    return {};
+  }
+
   py::object get_model(int env_id) {
     ValidateEnvIdOrThrow(env_id, nbatch_);
     raw::MjModel* model = EnsureUniqueModel(env_id);
@@ -1862,6 +1894,7 @@ class BatchEnvPool {
   int nstate_ = 0;
   int nv_ = 0;
   int nsensordata_ = 0;
+  std::vector<int> cpu_ids_;               // worker i → CPU id (empty = no pinning)
   std::vector<raw::MjModel*> models_;        // per-env model pointers (may alias)
   std::vector<raw::MjModel*> owned_models_;  // unique copies we own (for cleanup)
   std::unordered_map<raw::MjModel*, int> model_refcounts_;
@@ -1873,11 +1906,13 @@ class BatchEnvPool {
 
 PYBIND11_MODULE(_batch_env, pymodule) {
   py::class_<BatchEnvPool>(pymodule, "BatchEnvPool")
-      .def(py::init([](py::object base_model, int nbatch, int nthread) {
-             return std::make_unique<BatchEnvPool>(base_model, nbatch, nthread);
+      .def(py::init([](py::object base_model, int nbatch, int nthread,
+                       std::vector<int> cpu_ids) {
+             return std::make_unique<BatchEnvPool>(base_model, nbatch, nthread,
+                                                   std::move(cpu_ids));
            }),
            py::kw_only(), py::arg("model"), py::arg("nbatch"),
-           py::arg("nthread"))
+           py::arg("nthread"), py::arg("cpu_ids") = std::vector<int>{})
       .def("step", &BatchEnvPool::step, py::kw_only(), py::arg("nstep"),
            py::arg("control_spec"), py::arg("state0"),
            py::arg("warmstart0") = py::none(),
@@ -1917,7 +1952,9 @@ PYBIND11_MODULE(_batch_env, pymodule) {
       .def_property_readonly("nthread", &BatchEnvPool::nthread)
       .def_property_readonly("nstate", &BatchEnvPool::nstate)
       .def_property_readonly("nv", &BatchEnvPool::nv)
-      .def_property_readonly("nsensordata", &BatchEnvPool::nsensordata);
+      .def_property_readonly("nsensordata", &BatchEnvPool::nsensordata)
+      .def_property_readonly("cpu_ids", &BatchEnvPool::cpu_ids)
+      .def("worker_cpu_ids", &BatchEnvPool::worker_cpu_ids);
 
   pymodule.attr("SUPPORTED_FIELDS") = []() {
     py::list out;

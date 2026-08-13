@@ -175,6 +175,16 @@ from mujoco_uni.batch_env import BatchEnvPool, SUPPORTED_FIELDS
 
 基础的 `BatchEnvPool` 执行器内部没有 MPI 或 OpenMP。大规模的多进程、多插槽（socket）或多节点采样，由位于 `BatchEnvPool`之上的一层组合多个本地执行器来完成。
 
+### Worker CPU 亲和性（Linux）
+
+`BatchEnvPool` 接受可选的 `cpu_ids` 序列，把每个原生工作线程钉到显式指定的 CPU 上，使多个池可以稳定在互不重叠的 CPU 集合上运行：
+
+```python
+pool = BatchEnvPool(model, nbatch=64, cpu_ids=[0, 1, 2, 3])
+```
+
+`cpu_ids[i]` 钉住工作线程 `i`，即与 `nthread` 一一对应：其长度必须等于 `nthread`；省略 `nthread` 时按 `len(cpu_ids)` 推断。CPU id 在构造时校验（非负、不重复、对当前进程可用），非法输入抛出 `ValueError`。配置的映射可通过只读属性 `pool.cpu_ids` 查询，`pool.worker_cpu_ids()` 返回钉核后每个 worker 实际观测到的 CPU。未配置 `cpu_ids` 时调度行为保持不变。CPU 钉核仅支持 Linux。
+
 ## 公共 API
 
 稳定的公共 API 是 `mujoco_uni.batch_env`。

@@ -15,6 +15,7 @@
 #ifndef MUJOCO_PYTHON_THREADPOOL_H_
 #define MUJOCO_PYTHON_THREADPOOL_H_
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -30,13 +31,28 @@ namespace mujoco::python {
 // ThreadPool class
 class ThreadPool {
  public:
-  // constructor
-  explicit ThreadPool(int num_threads);
+  // constructor. When cpu_ids is non-empty it must have exactly
+  // num_threads entries and worker i is pinned to cpu_ids[i] (Linux only).
+  // The constructor blocks until every worker has applied its affinity and
+  // recorded the CPU it observed at startup.
+  explicit ThreadPool(int num_threads, std::vector<int> cpu_ids = {});
 
   // destructor
   ~ThreadPool();
 
   int NumThreads() const { return threads_.size(); }
+
+  // CPU ids requested at construction (empty when no pinning was requested).
+  const std::vector<int>& CpuIds() const { return cpu_ids_; }
+
+  // Per-worker CPU observed at worker startup, after pinning. Entries are
+  // -1 for workers without a requested pin. Valid once the constructor has
+  // returned.
+  std::vector<int> ObservedCpuIds() const { return observed_cpus_; }
+
+  // Zero when all requested pins succeeded, otherwise the error code from
+  // the first failing pin attempt (ENOTSUP on non-Linux platforms).
+  int PinError() const { return pin_error_.load(std::memory_order_relaxed); }
 
   // returns an ID between 0 and NumThreads() - 1. must be called within
   // worker thread (returns -1 if not).
@@ -73,6 +89,13 @@ class ThreadPool {
   std::condition_variable cv_ext_;
   std::queue<std::function<void()>> queue_;
   std::uint64_t ctr_;
+
+  // CPU affinity state (cold path only, finalized before the constructor
+  // returns).
+  std::vector<int> cpu_ids_;
+  std::vector<int> observed_cpus_;
+  std::atomic<int> startup_count_;
+  std::atomic<int> pin_error_;
 };
 
 }  // namespace mujoco::python

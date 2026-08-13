@@ -31,7 +31,9 @@ Supported randomization fields are listed in ``SUPPORTED_FIELDS``.
 from __future__ import annotations
 
 import numbers
+import os
 import re
+import sys
 from typing import Any, Dict, Optional, Sequence, Union
 
 import numpy as np
@@ -130,6 +132,39 @@ def _normalize_scalar_int(name: str, value) -> int:
   return int(value)
 
 
+def _normalize_cpu_ids(cpu_ids, nthread: Optional[int]) -> tuple[list[int], int]:
+  """Validate ``cpu_ids`` and resolve the effective worker count.
+
+  ``cpu_ids[i]`` pins worker thread ``i`` to one CPU, so the mapping is
+  1:1 with ``nthread``. When ``nthread`` is ``None`` it is inferred from
+  ``len(cpu_ids)``.
+  """
+  if sys.platform != "linux":
+    raise ValueError("cpu_ids pinning is only supported on Linux")
+  if isinstance(cpu_ids, (str, bytes)):
+    raise TypeError("cpu_ids must be a sequence of integer CPU ids")
+  ids = [_normalize_scalar_int("cpu_ids entry", value) for value in cpu_ids]
+  if not ids:
+    raise ValueError("cpu_ids must be non-empty")
+  if any(cpu_id < 0 for cpu_id in ids):
+    raise ValueError("cpu_ids entries must be >= 0")
+  if len(set(ids)) != len(ids):
+    raise ValueError("cpu_ids entries must be unique")
+  available = os.sched_getaffinity(0)
+  unavailable = [cpu_id for cpu_id in ids if cpu_id not in available]
+  if unavailable:
+    raise ValueError(
+        f"cpu_ids {unavailable} are not available to this process"
+    )
+  if nthread is None:
+    return ids, len(ids)
+  if int(nthread) != len(ids):
+    raise ValueError(
+        f"cpu_ids length ({len(ids)}) must equal nthread ({int(nthread)})"
+    )
+  return ids, int(nthread)
+
+
 def _normalize_indexed_value(name: str, scalar_index: bool, nindex: int, value):
   width = _FIELD_COMPONENT_WIDTHS[name]
   arr = np.asarray(value, dtype=np.float64)
@@ -159,6 +194,7 @@ class BatchEnvPool:
       *,
       nbatch: int,
       nthread: Optional[int] = None,
+      cpu_ids: Optional[Sequence[int]] = None,
   ):
     """Construct a batch pool from one model or a compatible model sequence.
 
@@ -167,14 +203,25 @@ class BatchEnvPool:
         sequence of ``MjModel`` instances with length ``1`` or ``nbatch``.
       nbatch: Number of environments in the pool.
       nthread: Number of worker threads. ``None`` means ``0``.
+      cpu_ids: Optional explicit worker CPU affinity (Linux only).
+        ``cpu_ids[i]`` pins worker thread ``i`` to one CPU, so its length
+        must equal ``nthread``; when ``nthread`` is ``None`` it is inferred
+        from ``len(cpu_ids)``. Requires threaded mode (``nthread >= 1``).
+        ``None`` keeps the default OS scheduling behavior.
     """
     if nbatch <= 0:
       raise ValueError("nbatch must be positive")
     if not isinstance(model, mujoco.MjModel):
       model = list(model)
+    native_cpu_ids: list[int] = []
+    if cpu_ids is not None:
+      native_cpu_ids, nthread = _normalize_cpu_ids(cpu_ids, nthread)
     self._nthread = 0 if nthread is None else int(nthread)
     self._pool = _native.BatchEnvPool(
-        model=model, nbatch=int(nbatch), nthread=self._nthread
+        model=model,
+        nbatch=int(nbatch),
+        nthread=self._nthread,
+        cpu_ids=native_cpu_ids,
     )
 
   def __enter__(self) -> "BatchEnvPool":
@@ -208,6 +255,24 @@ class BatchEnvPool:
   @property
   def nsensordata(self) -> int:
     return self._pool.nsensordata
+
+  @property
+  def cpu_ids(self) -> Optional[tuple[int, ...]]:
+    """Configured worker→CPU mapping, or ``None`` when affinity is unset."""
+    if self._pool is None:
+      raise RuntimeError("cpu_ids requested after pool close")
+    ids = tuple(self._pool.cpu_ids)
+    return ids or None
+
+  def worker_cpu_ids(self) -> tuple[int, ...]:
+    """Per-worker CPU observed at pool startup, after pinning.
+
+    Entry ``i`` is the CPU worker ``i`` was actually running on once its
+    affinity was applied. Empty when ``cpu_ids`` was not configured.
+    """
+    if self._pool is None:
+      raise RuntimeError("worker_cpu_ids requested after pool close")
+    return tuple(self._pool.worker_cpu_ids())
 
   def get_all_models(self) -> list[mujoco.MjModel]:
     """Return pool-owned models without copying.

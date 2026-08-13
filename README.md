@@ -198,6 +198,25 @@ There is no MPI or OpenMP inside the base `BatchEnvPool` executor. Large-scale
 multi-process, multi-socket, or multi-node collection composes multiple local
 executors from a layer above `BatchEnvPool`.
 
+### Worker CPU affinity (Linux)
+
+`BatchEnvPool` accepts an optional `cpu_ids` sequence that pins each native
+worker thread to an explicit CPU, so multiple pools can be kept on disjoint
+CPU sets:
+
+```python
+pool = BatchEnvPool(model, nbatch=64, cpu_ids=[0, 1, 2, 3])
+```
+
+`cpu_ids[i]` pins worker thread `i`, so the mapping is 1:1 with `nthread`:
+its length must equal `nthread`, and when `nthread` is omitted it is inferred
+from `len(cpu_ids)`. CPU ids are validated at construction (non-negative,
+unique, available to the process); invalid input raises `ValueError`. The
+configured mapping is exposed read-only via `pool.cpu_ids`, and
+`pool.worker_cpu_ids()` reports the CPU each worker was actually observed on
+after pinning. When `cpu_ids` is not given, scheduling behavior is unchanged.
+CPU pinning is supported on Linux only.
+
 ## Public API
 
 The stable public API is `mujoco_uni.batch_env`.
