@@ -133,6 +133,7 @@ _FIELD_COMPONENT_WIDTHS = {
     "kd": 1,
     "geom_size": 3,
     "geom_pos": 3,
+    "mocap_pos": 3,
 }
 
 

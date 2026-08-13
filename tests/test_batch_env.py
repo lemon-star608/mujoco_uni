@@ -63,6 +63,7 @@ def test_batch_env_constructs_from_official_mujoco_model() -> None:
         "kd",
         "geom_size",
         "geom_pos",
+        "mocap_pos",
     }
 
     with BatchEnvPool(model, nbatch=2, nthread=1) as pool:
@@ -70,6 +71,39 @@ def test_batch_env_constructs_from_official_mujoco_model() -> None:
         assert pool.nthread == 1
         assert pool.nstate == mj.mj_stateSize(model, mj.mjtState.mjSTATE_FULLPHYSICS)
         assert pool.get_model(0).nbody == model.nbody
+
+
+def test_mocap_pos_reset_is_batched_persistent_and_indexed() -> None:
+    import numpy as np
+
+    from mujoco_uni.batch_env import BatchEnvPool
+
+    mj: Any = mujoco
+    model = mj.MjModel.from_xml_string(
+        """
+        <mujoco><worldbody>
+          <body name="table" pos="0 0 0.38" mocap="true">
+            <geom name="table_box" type="box" size="1 1 0.1"/>
+          </body>
+        </worldbody></mujoco>
+        """
+    )
+    nstate = mj.mj_stateSize(model, mj.mjtState.mjSTATE_FULLPHYSICS)
+    state = np.zeros((3, nstate), dtype=np.float64)
+    state[:, 1 : 1 + model.nq] = model.qpos0
+    with BatchEnvPool(model, nbatch=3, nthread=1) as pool:
+        target = np.array([[0.0, 0.0, 0.41]], dtype=np.float64)
+        pool.reset([1], state[[1]], randomization={"mocap_pos": target})
+        assert np.allclose(pool.get_field(0, "mocap_pos"), [0.0, 0.0, 0.38])
+        assert np.allclose(pool.get_field(1, "mocap_pos"), target.reshape(-1))
+        assert np.allclose(pool.get_field(2, "mocap_pos"), [0.0, 0.0, 0.38])
+        assert np.allclose(pool.get_field_indexed(1, "mocap_pos", 0), target[0])
+        pool.set_field_indexed(1, "mocap_pos", 0, [0.0, 0.0, 0.42])
+        assert np.allclose(pool.get_field_indexed(1, "mocap_pos", 0), [0.0, 0.0, 0.42])
+        pool.reset([1], state[[1]])
+        stepped = pool.step(state, nstep=1)
+        assert np.allclose(pool.get_field(1, "mocap_pos"), [0.0, 0.0, 0.42])
+        assert stepped.shape == state.shape
 
 
 def test_geom_bounds_parity_after_growth() -> None:

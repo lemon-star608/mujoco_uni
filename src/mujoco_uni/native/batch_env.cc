@@ -97,6 +97,7 @@ enum class FieldId {
   kKd,
   kGeomSize,
   kGeomPos,
+  kMocapPos,
 };
 
 struct FieldSpec {
@@ -118,6 +119,7 @@ constexpr FieldSpec kFieldSpecs[] = {
     {"kd",            FieldId::kKd,           false, false},
     {"geom_size",     FieldId::kGeomSize,     true,  true},
     {"geom_pos",      FieldId::kGeomPos,      true,  false},
+    {"mocap_pos",     FieldId::kMocapPos,     false, false},
 };
 
 // Element count of the field for a given model.
@@ -134,6 +136,7 @@ int FieldSize(FieldId id, const raw::MjModel* m) {
     case FieldId::kKd:           return m->nu;
     case FieldId::kGeomSize:     return 3 * m->ngeom;
     case FieldId::kGeomPos:      return 3 * m->ngeom;
+    case FieldId::kMocapPos:     return 3 * m->nmocap;
   }
   return 0;
 }
@@ -146,6 +149,7 @@ int FieldComponentWidth(FieldId id) {
     case FieldId::kGeomFriction:
     case FieldId::kGeomSize:
     case FieldId::kGeomPos:
+    case FieldId::kMocapPos:
       return 3;
     case FieldId::kBodyIquat:
       return 4;
@@ -173,6 +177,8 @@ int FieldIndexCount(FieldId id, const raw::MjModel* m) {
     case FieldId::kGeomSize:
     case FieldId::kGeomPos:
       return m->ngeom;
+    case FieldId::kMocapPos:
+      return m->nmocap;
     case FieldId::kKp:
     case FieldId::kKd:
       return m->nu;
@@ -192,6 +198,7 @@ mjtNum* ContiguousFieldPtr(FieldId id, raw::MjModel* m) {
     case FieldId::kGeomFriction: return m->geom_friction;
     case FieldId::kGeomSize:     return m->geom_size;
     case FieldId::kGeomPos:      return m->geom_pos;
+    case FieldId::kMocapPos:     return nullptr;
     case FieldId::kKp:
     case FieldId::kKd:
       return nullptr;
@@ -204,6 +211,13 @@ const mjtNum* ContiguousFieldPtr(FieldId id, const raw::MjModel* m) {
 }
 
 void CopyFieldOut(FieldId id, const raw::MjModel* m, mjtNum* dst) {
+  if (id == FieldId::kMocapPos) {
+    for (int body = 0; body < m->nbody; ++body) {
+      int mocap = m->body_mocapid[body];
+      if (mocap >= 0) mju_copy3(dst + 3 * mocap, m->body_pos + 3 * body);
+    }
+    return;
+  }
   switch (id) {
     case FieldId::kBodyMass:
     case FieldId::kBodyIpos:
@@ -214,6 +228,7 @@ void CopyFieldOut(FieldId id, const raw::MjModel* m, mjtNum* dst) {
     case FieldId::kGeomFriction:
     case FieldId::kGeomSize:
     case FieldId::kGeomPos:
+    case FieldId::kMocapPos:
       mju_copy(dst, ContiguousFieldPtr(id, m), FieldSize(id, m));
       return;
 
@@ -242,6 +257,7 @@ void WriteField(FieldId id, raw::MjModel* m, const mjtNum* src) {
     case FieldId::kGeomFriction:
     case FieldId::kGeomSize:
     case FieldId::kGeomPos:
+    case FieldId::kMocapPos:
       mju_copy(ContiguousFieldPtr(id, m), src, FieldSize(id, m));
       return;
 
@@ -262,6 +278,16 @@ void WriteField(FieldId id, raw::MjModel* m, const mjtNum* src) {
 
 void CopyIndexedFieldOut(FieldId id, const raw::MjModel* m, int index,
                          mjtNum* dst) {
+  if (id == FieldId::kMocapPos) {
+    for (int body = 0; body < m->nbody; ++body) {
+      if (m->body_mocapid[body] == index) {
+        mju_copy3(dst, m->body_pos + 3 * body);
+        return;
+      }
+    }
+    mju_zero(dst, 3);
+    return;
+  }
   int width = FieldComponentWidth(id);
   switch (id) {
     case FieldId::kBodyMass:
@@ -273,6 +299,7 @@ void CopyIndexedFieldOut(FieldId id, const raw::MjModel* m, int index,
     case FieldId::kGeomFriction:
     case FieldId::kGeomSize:
     case FieldId::kGeomPos:
+    case FieldId::kMocapPos:
       mju_copy(dst, ContiguousFieldPtr(id, m) + static_cast<size_t>(index) * width,
                width);
       return;
@@ -315,6 +342,7 @@ void WriteIndexedField(FieldId id, raw::MjModel* m, int index,
     case FieldId::kGravity:
     case FieldId::kGeomFriction:
     case FieldId::kGeomPos:
+    case FieldId::kMocapPos:
       mju_copy(ContiguousFieldPtr(id, m) + static_cast<size_t>(index) * width, src,
                width);
       return;
@@ -750,6 +778,7 @@ struct PerEnvFields {
   size_t kd_offset = 0, kd_bytes = 0;
   size_t geom_size_offset = 0, geom_size_bytes = 0;
   size_t geom_pos_offset = 0, geom_pos_bytes = 0;
+  size_t mocap_pos_offset = 0, mocap_pos_bytes = 0;
 
   void InitLayout(const raw::MjModel* base) {
     size_t off = 0;
@@ -797,6 +826,10 @@ struct PerEnvFields {
     geom_pos_bytes = static_cast<size_t>(base->ngeom) * 3 * sizeof(mjtNum);
     off += geom_pos_bytes;
 
+    mocap_pos_offset = off;
+    mocap_pos_bytes = static_cast<size_t>(base->nmocap) * 3 * sizeof(mjtNum);
+    off += mocap_pos_bytes;
+
     data.resize(off);
     std::memcpy(data.data() + body_mass_offset, base->body_mass, body_mass_bytes);
     std::memcpy(data.data() + body_ipos_offset, base->body_ipos, body_ipos_bytes);
@@ -811,6 +844,14 @@ struct PerEnvFields {
     }
     std::memcpy(data.data() + geom_size_offset, base->geom_size, geom_size_bytes);
     std::memcpy(data.data() + geom_pos_offset, base->geom_pos, geom_pos_bytes);
+    if (mocap_pos_bytes > 0) {
+      mjtNum* dst = reinterpret_cast<mjtNum*>(data.data() + mocap_pos_offset);
+      mju_zero(dst, 3 * base->nmocap);
+      for (int body = 0; body < base->nbody; ++body) {
+        int mocap = base->body_mocapid[body];
+        if (mocap >= 0) mju_copy3(dst + 3 * mocap, base->body_pos + 3 * body);
+      }
+    }
   }
 
   // Returns (ptr_into_data, total_bytes) for the given field, or (nullptr, 0) if not stored.
@@ -825,6 +866,7 @@ struct PerEnvFields {
       case FieldId::kGravity:      return {data.data() + gravity_offset,       gravity_bytes};
       case FieldId::kGeomSize:     return {data.data() + geom_size_offset,     geom_size_bytes};
       case FieldId::kGeomPos:      return {data.data() + geom_pos_offset,      geom_pos_bytes};
+      case FieldId::kMocapPos:     return {data.data() + mocap_pos_offset,     mocap_pos_bytes};
       case FieldId::kKp:           return {data.data() + kp_offset,            kp_bytes};
       case FieldId::kKd:           return {data.data() + kd_offset,            kd_bytes};
     }
@@ -836,6 +878,13 @@ struct PerEnvFields {
 };
 
 using PerEnvFieldsMap = std::unordered_map<int, PerEnvFields>;
+
+bool HasModelFieldOverrides(const PerEnvFields& f) {
+  return f.body_mass_bytes || f.body_ipos_bytes || f.body_iquat_bytes ||
+         f.body_inertia_bytes || f.geom_friction_bytes || f.dof_armature_bytes ||
+         f.gravity_bytes || f.kp_bytes || f.kd_bytes || f.geom_size_bytes ||
+         f.geom_pos_bytes;
+}
 
 // Apply per-env fields from the side-table into a scratch model.
 // Calls mj_setConst when body fields changed (requires worker MjData).
@@ -896,7 +945,42 @@ bool ApplyEnvFieldsToModel(int env_id, const PerEnvFieldsMap& pef,
   if (f.geom_pos_bytes > 0) {
     std::memcpy(scratch->geom_pos, f.data.data() + f.geom_pos_offset, f.geom_pos_bytes);
   }
+  // mocap_pos is runtime state, not model geometry. It is copied into the
+  // worker mjData by ApplyEnvMocapState below and deliberately not patched
+  // into scratch models, preserving heterogeneous model variants.
   return true;
+}
+
+void ApplyEnvMocapState(int env_id, const PerEnvFieldsMap& pef,
+                        const raw::MjModel* model, raw::MjData* d) {
+  auto it = pef.find(env_id);
+  if (it == pef.end() || it->second.mocap_pos_bytes == 0) {
+    for (int i = 0; i < model->nmocap; ++i) {
+      // model mocap defaults are body local positions; copy via body mapping.
+      for (int body = 0; body < model->nbody; ++body) {
+        int mocap = model->body_mocapid[body];
+        if (mocap == i) mju_copy3(d->mocap_pos + 3 * i, model->body_pos + 3 * body);
+      }
+    }
+    return;
+  }
+  const PerEnvFields& f = it->second;
+  std::memcpy(d->mocap_pos, f.data.data() + f.mocap_pos_offset,
+              f.mocap_pos_bytes);
+}
+
+void ApplyMocapState(int env_id, const raw::MjModel* model, raw::MjData* d,
+                     const PerEnvFieldsMap* pef) {
+  if (pef != nullptr) {
+    ApplyEnvMocapState(env_id, *pef, model, d);
+    return;
+  }
+  for (int i = 0; i < model->nmocap; ++i) {
+    for (int body = 0; body < model->nbody; ++body) {
+      int mocap = model->body_mocapid[body];
+      if (mocap == i) mju_copy3(d->mocap_pos + 3 * i, model->body_pos + 3 * body);
+    }
+  }
 }
 
 // ===================================================================
@@ -972,7 +1056,9 @@ void _unsafe_step(const std::vector<const raw::MjModel*>& m, raw::MjData* d,
         *cached_env_id = static_cast<int>(r);
       }
       auto it2 = per_env_fields->find(static_cast<int>(r));
-      mr = (it2 != per_env_fields->end()) ? scratch_model : m[0];
+      mr = (it2 != per_env_fields->end() && HasModelFieldOverrides(it2->second))
+               ? scratch_model
+               : m[r];
     } else {
       mr = m[r];
     }
@@ -996,6 +1082,7 @@ void _unsafe_step(const std::vector<const raw::MjModel*>& m, raw::MjData* d,
     }
 
     mj_setState(mr, d, state0 + r * nstate, mjSTATE_FULLPHYSICS);
+    ApplyMocapState(static_cast<int>(r), mr, d, per_env_fields);
 
     if (warmstart0) {
       mju_copy(d->qacc_warmstart, warmstart0 + r * nv, nv);
@@ -1053,6 +1140,7 @@ void _unsafe_step(const std::vector<const raw::MjModel*>& m, raw::MjData* d,
           d->eq_active[i] = mr->eq_active0[i];
         }
         mj_setState(mr, d, state_out + r * nstate, mjSTATE_FULLPHYSICS);
+        ApplyMocapState(static_cast<int>(r), mr, d, per_env_fields);
         mju_zero(d->qacc_warmstart, nv);
         for (int i = 0; i < mjNWARNING; i++) {
           d->warning[i].number = 0;
@@ -1147,7 +1235,9 @@ void _unsafe_subset_reset_range(
         *cached_env_id = e;
       }
       auto it2 = per_env_fields->find(e);
-      me = (it2 != per_env_fields->end()) ? scratch_model : models[0];
+      me = (it2 != per_env_fields->end() && HasModelFieldOverrides(it2->second))
+               ? scratch_model
+               : models[e];
     } else {
       me = models[e];
     }
@@ -1176,6 +1266,7 @@ void _unsafe_subset_reset_range(
 
     mj_setState(me, d, initial_state + static_cast<size_t>(k) * nstate,
                 mjSTATE_FULLPHYSICS);
+    ApplyMocapState(e, me, d, per_env_fields);
 
     if (initial_warmstart) {
       mju_copy(d->qacc_warmstart,
@@ -1290,7 +1381,9 @@ void _unsafe_full_forward_range(const std::vector<raw::MjModel*>& models,
         *cached_env_id = r;
       }
       auto it2 = per_env_fields->find(r);
-      me = (it2 != per_env_fields->end()) ? scratch_model : models[0];
+      me = (it2 != per_env_fields->end() && HasModelFieldOverrides(it2->second))
+               ? scratch_model
+               : models[r];
     } else {
       me = models[r];
     }
@@ -1312,6 +1405,7 @@ void _unsafe_full_forward_range(const std::vector<raw::MjModel*>& models,
 
     mj_setState(me, d, state0 + static_cast<size_t>(r) * nstate,
                 mjSTATE_FULLPHYSICS);
+    ApplyMocapState(r, me, d, per_env_fields);
     if (warmstart0) {
       mju_copy(d->qacc_warmstart,
                warmstart0 + static_cast<size_t>(r) * nv, nv);
@@ -2235,7 +2329,7 @@ class BatchEnvPool {
           // Ensure side-table entry exists
           if (per_env_fields_.find(e) == per_env_fields_.end()) {
             per_env_fields_[e] = PerEnvFields();
-            per_env_fields_[e].InitLayout(models_[0]);
+            per_env_fields_[e].InitLayout(models_[e]);
           }
           PerEnvFields& fields = per_env_fields_[e];
           fields.needs_patch = true;
@@ -2263,6 +2357,8 @@ class BatchEnvPool {
             std::memcpy(fields.data.data() + fields.kp_offset, src_row, fields.kp_bytes);
           } else if (spec->id == FieldId::kKd) {
             std::memcpy(fields.data.data() + fields.kd_offset, src_row, fields.kd_bytes);
+          } else if (spec->id == FieldId::kMocapPos) {
+            std::memcpy(fields.data.data() + fields.mocap_pos_offset, src_row, fields.mocap_pos_bytes);
           }
         }
         // geom_bounds refresh done lazily in ApplyEnvFieldsToModel
@@ -2369,9 +2465,13 @@ class BatchEnvPool {
   py::object get_model(int env_id) {
     ValidateEnvIdOrThrow(env_id, nbatch_);
 
-    // If this env has per-env fields, patch them into a temp model
-    if (per_env_fields_.find(env_id) != per_env_fields_.end()) {
-      raw::MjModel* temp = InterceptMjErrors(mj_copyModel)(nullptr, models_[0]);
+    // Only model-level overrides require a temporary patched model. Runtime
+    // mocap_pos lives in the per-env mjData side-table and must keep exposing
+    // this env's own variant model for geometry/introspection queries.
+    auto fields_it = per_env_fields_.find(env_id);
+    if (fields_it != per_env_fields_.end() &&
+        HasModelFieldOverrides(fields_it->second)) {
+      raw::MjModel* temp = InterceptMjErrors(mj_copyModel)(nullptr, models_[env_id]);
       if (!temp) {
         throw py::value_error("mj_copyModel failed in get_model");
       }
@@ -2514,7 +2614,7 @@ class BatchEnvPool {
     // NEW: write into side-table, mark needs_patch
     if (per_env_fields_.find(env_id) == per_env_fields_.end()) {
       per_env_fields_[env_id] = PerEnvFields();
-      per_env_fields_[env_id].InitLayout(models_[0]);  // use base model
+      per_env_fields_[env_id].InitLayout(models_[env_id]);
     }
     auto& fields = per_env_fields_[env_id];
     fields.needs_patch = true;
